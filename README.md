@@ -255,6 +255,12 @@ Plan Max se justifica cuando el PMO se usa 70+ veces/día, o cuando se suma el u
 
 ## Comunicación SQLite
 
+## Licencia
+
+Aragón Attribution License v1.0 — Uso libre con atribución obligatoria. Ver [LICENSE](LICENSE).
+
+## Comunicación SQLite
+
 Usa la misma base de datos que el resto del ecosistema:
 
 | Tabla | Lee | Escribe | Qué |
