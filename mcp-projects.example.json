@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "project-mi-bot": {
+      "command": "python",
+      "args": [
+        "ruta/a/mcp-project-server/server.py",
+        "--root", "ruta/a/mi-bot",
+        "--pm2", "mi-bot",
+        "--name", "mi-bot"
+      ]
+    },
+    "project-mi-api": {
+      "command": "python",
+      "args": [
+        "ruta/a/mcp-project-server/server.py",
+        "--root", "ruta/a/mi-api",
+        "--pm2", "mi-api",
+        "--name", "mi-api"
+      ]
+    }
+  }
+}

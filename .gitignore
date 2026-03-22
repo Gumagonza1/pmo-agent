@@ -1,0 +1,7 @@
+node_modules/
+state/
+*.log
+.env
+.env.*
+config.js
+mcp-projects.json

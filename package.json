@@ -1,0 +1,9 @@
+{
+  "name": "pmo-agent",
+  "version": "1.0.0",
+  "description": "Agente PMO — ejecuta instrucciones y autocorrecciones usando Claude Code (plan Max)",
+  "main": "index.js",
+  "dependencies": {
+    "better-sqlite3": "^9.4.3"
+  }
+}
