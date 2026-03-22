@@ -263,6 +263,3 @@ Usa la misma base de datos que el resto del ecosistema:
 | `mensajes_queue` | `origen = 'autocorrect'` | `origen = 'pmo'` | Autocorrections + reportes |
 | `pmo_ejecuciones` | — | sí | Historial de ejecuciones |
 
-## Licencia
-
-MIT
