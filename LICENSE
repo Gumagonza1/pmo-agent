@@ -1,26 +1,52 @@
 Aragón Attribution License v1.0
 
 Copyright (c) 2026 Antonio Aragón (Ecosistema Aragón)
+Todos los derechos reservados salvo los expresamente concedidos aquí.
 
 Se concede permiso para usar, copiar, modificar y distribuir este software
 y su documentación, sujeto a las siguientes condiciones:
 
 1. ATRIBUCIÓN OBLIGATORIA
    Cualquier uso, redistribución o trabajo derivado debe incluir de forma
-   visible y legible:
+   visible y legible en la documentación, interfaz o README:
    - El nombre del autor original: Antonio Aragón
    - Un enlace al repositorio original: https://github.com/Gumagonza1/pmo-agent
    - La mención: "Basado en PMO Agent de Antonio Aragón"
+   Esta atribución no puede ser removida, ocultada ni minimizada.
 
-2. USO COMERCIAL PERMITIDO
-   Se permite el uso comercial siempre que se cumpla la condición de
-   atribución del punto 1.
+2. PROHIBICIÓN DE APROPIACIÓN
+   Ningún individuo, empresa u organización puede:
+   a) Reclamar autoría original de este software o sus componentes.
+   b) Registrar marcas, patentes o derechos de autor sobre este software,
+      su nombre ("PMO Agent"), su arquitectura o sus derivados.
+   c) Redistribuir este software como propio sin la atribución del punto 1.
+   d) Presentar trabajos derivados como creaciones independientes sin
+      reconocer el origen.
 
-3. SIN GARANTÍA
+3. COMPONENTES PROTEGIDOS
+   Los siguientes componentes son propiedad intelectual del autor y están
+   sujetos a las mismas condiciones de atribución:
+   a) Los prompts de sistema (prompts/autocorrect.md, prompts/pmo-instruction.md)
+   b) El MCP Project Server (mcp-project-server/server.py) y sus 24 herramientas
+   c) La arquitectura: patrón claude -p + MCP servers + SQLite + Telegram
+   d) El diseño de sesiones con contexto temporal
+
+4. USO COMERCIAL PERMITIDO
+   Se permite el uso comercial siempre que se cumplan las condiciones de
+   atribución (punto 1) y no se viole la prohibición de apropiación (punto 2).
+
+5. SIN GARANTÍA
    Este software se proporciona "tal cual", sin garantía de ningún tipo,
    expresa o implícita. El autor no será responsable de ningún daño
    derivado del uso de este software.
 
-4. CONSERVAR ESTA LICENCIA
-   Esta licencia debe incluirse en todas las copias o partes sustanciales
-   del software.
+6. CONSERVAR ESTA LICENCIA
+   Esta licencia debe incluirse íntegra en todas las copias o partes
+   sustanciales del software. No puede ser modificada ni reemplazada
+   por otra licencia sin consentimiento escrito del autor.
+
+7. VIOLACIÓN
+   El incumplimiento de cualquier condición de esta licencia revoca
+   automáticamente todos los derechos concedidos.
+
+Contacto: https://github.com/Gumagonza1
