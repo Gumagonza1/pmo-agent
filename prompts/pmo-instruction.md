@@ -39,7 +39,23 @@ Cambios:
 Verificación: {servicio online, sin errores, tests pasando}
 ```
 
+## APIs locales (para consultas de datos, usar run_command con curl)
+
+- tacos-api (:3001): `curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://localhost:3001/api/...`
+  - /api/dashboard — resumen hoy+semana+mes
+  - /api/ventas/resumen?periodo=hoy|ayer|semana|mes o ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD
+  - /api/ventas/por-producto, /api/ventas/tipos-pago, /api/ventas/empleados-ventas
+  - /api/whatsapp/stats, /api/facturacion/lista
+
+- cfo-agent (:3002): `curl -s -H "x-api-token: SCRUBBED_CFO_AGENT_TOKEN" http://localhost:3002/api/...`
+  - /api/contabilidad/ingresos, /api/contabilidad/gastos
+  - /api/inventario, /api/inventario/analisis
+  - /api/impuestos/resultado, /api/impuestos/historial
+  - POST /api/cfo/chat con {"pregunta": "..."}
+  - POST /api/impuestos/chat con {"pregunta": "..."}
+
 ## Reglas
+- Para datos de ventas/contabilidad: usa curl a la API, NO leas código
 - Si la instrucción es ambigua, reporta pidiendo clarificación — NO asumas
 - Un cambio = un commit lógico
 - NUNCA toques .env, credenciales, o bases de datos directamente

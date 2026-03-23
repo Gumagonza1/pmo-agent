@@ -27,20 +27,31 @@ const fs       = require('fs');
 const path     = require('path');
 const crypto   = require('crypto');
 
-const { ejecutarClaude, getSesionInfo, resetSesion, estaEjecutando } = require('./claude-runner');
+const { execSync } = require('child_process');
+const { ejecutarClaude, getSesionInfo, getAllSesionesInfo, resetSesion, resetSesionProyecto, estaEjecutando } = require('./claude-runner');
 const {
   PROYECTOS,
+  TOPICS,
   MENSAJES_DB,
   STATE_DIR,
   POLL_INTERVAL_MS,
   MAX_CONCURRENT,
   COOLDOWN_MS,
+  APROBACION_CRITICO_MS,
+  APROBACION_NO_CRIT_MS,
+  CLAUDE_TIMEOUT_INSTRUCCION_MS,
+  CLAUDE_TIMEOUT_DIAGNOSTICO_MS,
+  CLAUDE_TIMEOUT_FIX_MS,
+  MAX_ERROR_DETAILS_CHARS,
+  MIN_DIAGNOSTICO_CHARS,
+  MAX_FILES_PER_FIX,
 } = require('./config');
 
 // ── Estado ────────────────────────────────────────────────────────────────
 
-let ejecutando   = 0;
-const cooldowns  = new Map(); // proyecto → timestamp último fix
+let ejecutando            = 0;
+const proyectosEjecutando = new Set(); // proyectos con ejecución activa
+const cooldowns           = new Map(); // proyecto → timestamp último fix
 
 // ── Base de datos ─────────────────────────────────────────────────────────
 
@@ -96,6 +107,50 @@ function enCooldown(proyecto) {
   return (Date.now() - ts) < COOLDOWN_MS;
 }
 
+// ── Seguridad auto-healing ─────────────────────────────────────────────────
+
+// Capa 1: Sanitizar texto externo antes de mandarlo al modelo.
+// Evita inyecciones de prompt en errorDetails del monitor y en mensajes del admin.
+function sanitizarTexto(raw, maxChars) {
+  let s = String(raw || '').slice(0, maxChars);
+  s = s.replace(/={3,}/g, '---');                                    // Romper delimitadores de sección
+  s = s.replace(/\[(INSTRUCCIONES?|TAREA|SISTEMA)\]/gi, '[INFO]');   // Neutralizar palabras clave de prompt
+  s = s.replace(/\x00/g, '');                                        // Eliminar null bytes
+  return s.trim();
+}
+
+// Alias específico para errorDetails del monitor
+function sanitizarErrorDetails(raw) {
+  return sanitizarTexto(raw, MAX_ERROR_DETAILS_CHARS);
+}
+
+// Capa 5: Validar diagnóstico estructurado.
+// El prompt de diagnóstico exige formato: DIAGNOSTICO|severidad|archivo|linea|desc|fix
+// Si el modelo no lo respeta o la severidad es BAJO, no se propone fix automático.
+const RE_DIAGNOSTICO = /DIAGNOSTICO\|(CRITICO|ALTO|MEDIO|BAJO)\|([^|]+)\|(\d+)\|([^|]+)\|(.+)/i;
+
+function parsearDiagnostico(texto) {
+  const match = texto.match(RE_DIAGNOSTICO);
+  if (!match) return null;
+  return {
+    severidad:    match[1].toUpperCase(),
+    archivo:      match[2].trim(),
+    linea:        parseInt(match[3], 10),
+    descripcion:  match[4].trim(),
+    fixPropuesto: match[5].trim(),
+  };
+}
+
+function diagnosticoValido(texto) {
+  if (!texto || texto.length < MIN_DIAGNOSTICO_CHARS) return false;
+  // Si tiene el formato estructurado, es válido (incluso BAJO, lo manejamos aparte)
+  if (RE_DIAGNOSTICO.test(texto)) return true;
+  // Fallback: texto libre con palabras técnicas (compatibilidad)
+  const lower = texto.toLowerCase();
+  const PALABRAS = ['causa', 'error', 'fix', 'cambio', 'archivo', 'línea', 'problema', 'soluci', 'fallo', 'log'];
+  return PALABRAS.some(p => lower.includes(p));
+}
+
 // ── Identificar proyecto desde texto ──────────────────────────────────────
 
 function identificarProyecto(texto) {
@@ -132,9 +187,112 @@ function identificarProyecto(texto) {
   return null;
 }
 
+// ── Procesar mensaje de un topic del grupo ────────────────────────────────
+
+async function procesarMensajeTopic(topicId, textoRaw) {
+  const texto = sanitizarTexto(textoRaw, 4000); // Capa 1: sanitizar input del admin
+  const topicConfig = TOPICS[topicId];
+  if (!topicConfig) {
+    log(`Topic desconocido: ${topicId}`);
+    encolarRespuesta(`Topic ${topicId} no configurado.`, 'pmo');
+    return;
+  }
+
+  const { proyecto: proyectoNombre, prompt: promptFile, nombre: topicNombre } = topicConfig;
+
+  // Si no tiene proyecto asignado (General), usar el flujo PMO normal
+  if (!proyectoNombre) {
+    return procesarInstruccionPMO(texto);
+  }
+
+  const config = PROYECTOS[proyectoNombre];
+  if (!config) {
+    log(`Proyecto no encontrado para topic ${topicNombre}: ${proyectoNombre}`);
+    encolarRespuesta(`Proyecto ${proyectoNombre} no configurado.`, 'pmo');
+    return;
+  }
+
+  if (ejecutando >= MAX_CONCURRENT) {
+    encolarRespuesta(`⏳ Hay una ejecución en curso. Tu mensaje en ${topicNombre} se procesará cuando termine.`, 'pmo');
+    return;
+  }
+
+  ejecutando++;
+  proyectosEjecutando.add(proyectoNombre);
+  const ejecId = generarId('topic');
+  const db = obtenerDb();
+
+  db.prepare(`
+    INSERT INTO pmo_ejecuciones (id, tipo, proyecto, instruccion, estado, ts_inicio)
+    VALUES (?, 'topic', ?, ?, 'ejecutando', ?)
+  `).run(ejecId, proyectoNombre, texto, Date.now());
+
+  const tsInicio = Date.now();
+  log(`[${topicNombre}] Procesando: ${texto.slice(0, 80)}...`);
+  encolarRespuesta(`🧠 [${topicNombre}] Procesando...\n\n"${texto.slice(0, 200)}"`, 'pmo');
+
+  let ultimaFase = '';
+  function onProgress(fase) {
+    if (fase === ultimaFase) return;
+    ultimaFase = fase;
+    const elapsed = Math.round((Date.now() - tsInicio) / 1000);
+    log(`  [${topicNombre}] ${fase} (${elapsed}s)`);
+    encolarRespuesta(`${fase}\n⏱️ ${topicNombre} — ${elapsed}s`, 'pmo');
+  }
+
+  try {
+    const resultado = await ejecutarClaude({
+      promptFile,
+      userPrompt: [
+        `Proyecto: ${proyectoNombre}`,
+        `PM2: ${config.pm2}`,
+        `Directorio: ${config.root}`,
+        config.puerto ? `Puerto HTTP: ${config.puerto}` : '',
+        `MCP Server: ${config.mcp}`,
+        '',
+        'Mensaje del administrador:',
+        texto,
+        '',
+        `Usa las herramientas del MCP server "${config.mcp}" para operar en este proyecto.`,
+      ].filter(Boolean).join('\n'),
+      projectName: config.mcp,
+      cwd: config.root,
+      timeout: CLAUDE_TIMEOUT_INSTRUCCION_MS,
+      onProgress,
+    });
+
+    const elapsed = Math.round((Date.now() - tsInicio) / 1000);
+
+    db.prepare(`
+      UPDATE pmo_ejecuciones SET resultado = ?, estado = ?, ts_fin = ? WHERE id = ?
+    `).run(resultado.output.slice(0, 10000), resultado.ok ? 'completado' : 'error', Date.now(), ejecId);
+
+    const icon = resultado.ok ? '✅' : '❌';
+    const sesInfo = getSesionInfo(config.mcp);
+    const sesTag = sesInfo ? `\n🔗 Sesión: msg #${sesInfo.mensajes}, ${sesInfo.restanteMin}min` : '';
+    encolarRespuesta(
+      `${icon} [${topicNombre}] — ${resultado.ok ? 'Completado' : 'Error'} (${elapsed}s)${sesTag}\n\n${resultado.output.slice(0, 3700)}`,
+      'pmo'
+    );
+    log(`[${topicNombre}] Completado: ${resultado.ok ? 'OK' : 'ERROR'} (${elapsed}s)`);
+
+  } catch (err) {
+    const elapsed = Math.round((Date.now() - tsInicio) / 1000);
+    log(`[${topicNombre}] Error: ${err.message}`);
+    encolarRespuesta(`❌ [${topicNombre}] — ERROR (${elapsed}s)\n\n${err.message}`, 'pmo');
+    db.prepare(`
+      UPDATE pmo_ejecuciones SET resultado = ?, estado = 'error', ts_fin = ? WHERE id = ?
+    `).run(err.message, Date.now(), ejecId);
+  } finally {
+    ejecutando--;
+    proyectosEjecutando.delete(proyectoNombre);
+  }
+}
+
 // ── Procesar instrucción PMO del admin ────────────────────────────────────
 
-async function procesarInstruccionPMO(texto) {
+async function procesarInstruccionPMO(textoRaw) {
+  const texto = sanitizarTexto(textoRaw, 4000); // Capa 1: sanitizar input del admin
   const textoLower = texto.toLowerCase().trim();
 
   // Comando: listar proyectos disponibles
@@ -160,18 +318,15 @@ async function procesarInstruccionPMO(texto) {
 
   // Comando: ver sesión activa
   if (textoLower === 'sesion' || textoLower === 'session' || textoLower === 'contexto') {
-    const info = getSesionInfo();
-    if (!info) {
-      encolarRespuesta('PMO — No hay sesión activa. Se creará una nueva con tu próximo mensaje.\n\nLas sesiones duran 1 hora y mantienen contexto entre mensajes.', 'pmo');
+    const sesiones = getAllSesionesInfo();
+    if (sesiones.length === 0) {
+      encolarRespuesta('PMO — No hay sesiones activas. Se creará una nueva con tu próximo mensaje.\n\nLas sesiones duran 1 hora por proyecto.', 'pmo');
     } else {
-      const fecha = new Date(info.creadoEn).toLocaleString('es-MX', { timeZone: 'America/Hermosillo' });
+      const lineas = sesiones.map(s => `📦 ${s.key}: msg #${s.mensajes}, ${s.restanteMin}min restantes`);
       encolarRespuesta(
-        `PMO — Sesión activa\n\n` +
-        `🕐 Creada: ${fecha}\n` +
-        `⏳ Expira en: ${info.restanteMin} min\n` +
-        `💬 Mensajes: ${info.mensajes}\n` +
-        `📦 Proyectos tocados: ${info.proyectos.length > 0 ? info.proyectos.join(', ') : '(ninguno aún)'}\n\n` +
-        `Claude recuerda TODO lo que has hablado en esta sesión.\n` +
+        `PMO — Sesiones activas (${sesiones.length})\n\n` +
+        lineas.join('\n') +
+        `\n\nCada proyecto mantiene su propio contexto.\n` +
         `Para empezar de cero: !pmo nueva sesion`,
         'pmo'
       );
@@ -213,6 +368,15 @@ async function procesarInstruccionPMO(texto) {
     return;
   }
 
+  // Comando: responder a propuesta de autocorrect
+  const matchAuto = textoLower.match(/^aplicar\s+(\S+)|^ignorar\s+(\S+)|^revertir\s+(\S+)/);
+  if (matchAuto) {
+    const propIdCorto = matchAuto[1] || matchAuto[2] || matchAuto[3];
+    const accion = matchAuto[1] ? 'aplicar' : matchAuto[2] ? 'ignorar' : 'revertir';
+    procesarRespuestaAutocorrect(propIdCorto, accion);
+    return;
+  }
+
   const proyecto = identificarProyecto(texto);
 
   if (!proyecto) {
@@ -231,6 +395,7 @@ async function procesarInstruccionPMO(texto) {
   }
 
   ejecutando++;
+  proyectosEjecutando.add(proyecto.nombre);
   const ejecId = generarId('pmo-exec');
   const db = obtenerDb();
 
@@ -271,6 +436,7 @@ async function procesarInstruccionPMO(texto) {
       ].filter(Boolean).join('\n'),
       projectName: proyecto.config.mcp,
       cwd: proyecto.config.root,
+      timeout: CLAUDE_TIMEOUT_INSTRUCCION_MS,
       onProgress,
     });
 
@@ -283,7 +449,7 @@ async function procesarInstruccionPMO(texto) {
 
     // Enviar reporte al admin con info de sesión
     const icon = resultado.ok ? '✅' : '❌';
-    const sesInfo = getSesionInfo();
+    const sesInfo = getSesionInfo(proyecto.config.mcp);
     const sesTag = sesInfo ? `\n🔗 Sesión: msg #${sesInfo.mensajes}, ${sesInfo.restanteMin}min restantes` : '';
     const reporte = resultado.ok
       ? `${icon} PMO [${proyecto.nombre}] — Completado (${elapsed}s)${sesTag}\n\n${resultado.output.slice(0, 3700)}`
@@ -301,63 +467,65 @@ async function procesarInstruccionPMO(texto) {
     `).run(err.message, Date.now(), ejecId);
   } finally {
     ejecutando--;
+    proyectosEjecutando.delete(proyecto.nombre);
   }
 }
 
-// ── Procesar autocorrección (trigger del monitor) ─────────────────────────
+// ── Sistema de propuestas de autocorrección ───────────────────────────────
 
-async function procesarAutocorrect(item) {
-  // item viene de mensajes_queue con origen='autocorrect'
-  // mensaje formato: "AUTOCORRECT|<proyecto>|<error_details>"
-  const partes = item.mensaje.split('|');
-  if (partes.length < 3) {
-    log(`Autocorrect: formato inválido — ${item.mensaje.slice(0, 100)}`);
+const propuestasPendientes = new Map(); // propuestaId → { proyecto, diagnostico, ejecId, timer, config }
+
+function procesarRespuestaAutocorrect(propId, accion) {
+  const prop = propuestasPendientes.get(propId);
+  if (!prop) {
+    log(`Propuesta ${propId} no encontrada o ya expiró`);
     return;
   }
 
-  const proyectoNombre = partes[1].trim();
-  const errorDetails   = partes.slice(2).join('|').trim();
-  const config         = PROYECTOS[proyectoNombre];
+  clearTimeout(prop.timer);
+  // Gap 1 fix: borrar ambas claves (larga y corta) para evitar double-action
+  propuestasPendientes.delete(prop.propId     || propId);
+  propuestasPendientes.delete(prop.propIdCorto || propId);
 
-  if (!config) {
-    log(`Autocorrect: proyecto desconocido — ${proyectoNombre}`);
-    encolarRespuesta(`AUTOCORRECT — Proyecto "${proyectoNombre}" no reconocido`, 'pmo');
-    return;
+  if (accion === 'aplicar') {
+    log(`[autocorrect] ${prop.proyecto} — Admin aprobó. Aplicando fix...`);
+    aplicarFix(prop).catch(err => log(`Error aplicando fix: ${err.message}`));
+  } else if (accion === 'ignorar') {
+    log(`[autocorrect] ${prop.proyecto} — Admin ignoró la propuesta`);
+    encolarRespuesta(`🚫 AUTOCORRECT [${prop.proyecto}] — Ignorado por admin`, 'pmo');
+    const db = obtenerDb();
+    db.prepare(`UPDATE pmo_ejecuciones SET estado = 'ignorado', ts_fin = ? WHERE id = ?`).run(Date.now(), prop.ejecId);
+  } else if (accion === 'revertir') {
+    log(`[autocorrect] ${prop.proyecto} — Admin pidió revertir`);
+    revertirFix(prop).catch(err => log(`Error revirtiendo: ${err.message}`));
+  }
+}
+
+async function aplicarFix(prop) {
+  const { proyecto: proyectoNombre, config, diagnostico, ejecId, errorDetails } = prop;
+
+  // Capa 3: Git stash antes de cualquier cambio (independiente de la IA)
+  let stashLabel = null;
+  try {
+    // Gap 3 fix: no interpolar variables en el string de shell — usar timestamp fijo
+    const stashMsg = `pmo-autocorrect-${Date.now()}`;
+    const stashOut = execSync(
+      `git stash push -u -m "${stashMsg}"`,
+      { cwd: config.root, timeout: 15000, encoding: 'utf8', stdio: 'pipe' }
+    ).trim();
+    stashLabel = stashMsg;
+    prop.stashLabel = stashLabel; // guardar en propData para que revertirFix pueda usarlo
+    log(`[aplicarFix] ${proyectoNombre} — git stash: ${stashOut.slice(0, 100)}`);
+  } catch (err) {
+    log(`[aplicarFix] ${proyectoNombre} — sin stash (puede no ser repo git): ${err.message.slice(0, 80)}`);
   }
 
-  if (enCooldown(proyectoNombre)) {
-    log(`Autocorrect: ${proyectoNombre} en cooldown, ignorando`);
-    return;
-  }
-
-  if (ejecutando >= MAX_CONCURRENT) {
-    log(`Autocorrect: ya hay ejecución en curso, posponiendo`);
-    return; // Se reintentará en el siguiente ciclo
-  }
+  // Nueva sesión para el fix — evita "Session ID already in use" del diagnóstico previo
+  resetSesionProyecto(config.mcp);
 
   ejecutando++;
-  cooldowns.set(proyectoNombre, Date.now());
-
-  const ejecId = generarId('autocorrect');
-  const db = obtenerDb();
-
-  db.prepare(`
-    INSERT INTO pmo_ejecuciones (id, tipo, proyecto, instruccion, estado, ts_inicio)
-    VALUES (?, 'autocorrect', ?, ?, 'ejecutando', ?)
-  `).run(ejecId, proyectoNombre, errorDetails.slice(0, 5000), Date.now());
-
-  const tsInicio = Date.now();
-  log(`Autocorrect iniciado para ${proyectoNombre}`);
-  encolarRespuesta(`🔧 AUTOCORRECT [${proyectoNombre}] — Iniciando diagnóstico...\n\n⚠️ Error: ${errorDetails.slice(0, 200)}`, 'pmo');
-
-  let ultimaFase = '';
-  function onProgress(fase) {
-    if (fase === ultimaFase) return;
-    ultimaFase = fase;
-    const elapsed = Math.round((Date.now() - tsInicio) / 1000);
-    log(`  [autocorrect:${proyectoNombre}] ${fase} (${elapsed}s)`);
-    encolarRespuesta(`${fase}\n⏱️ autocorrect ${proyectoNombre} — ${elapsed}s`, 'pmo');
-  }
+  proyectosEjecutando.add(proyectoNombre);
+  encolarRespuesta(`🔧 AUTOCORRECT [${proyectoNombre}] — Aplicando fix...`, 'pmo');
 
   try {
     const resultado = await ejecutarClaude({
@@ -368,82 +536,364 @@ async function procesarAutocorrect(item) {
         `Directorio: ${config.root}`,
         config.puerto ? `Puerto HTTP: ${config.puerto}` : '',
         `MCP Server: ${config.mcp}`,
-        `Crítico: ${config.critico ? 'SÍ' : 'No'}`,
         '',
-        'Error detectado por el monitor:',
+        'Diagnóstico previo:',
+        diagnostico,
+        '',
+        'Error original:',
         errorDetails,
         '',
-        `IMPORTANTE: Usa SOLO las herramientas del MCP server "${config.mcp}" para operar en este proyecto.`,
+        `APLICA el fix descrito en el diagnóstico. Usa las herramientas del MCP server "${config.mcp}".`,
       ].filter(Boolean).join('\n'),
       projectName: config.mcp,
       cwd: config.root,
-      onProgress,
+      timeout: CLAUDE_TIMEOUT_FIX_MS,
+    });
+
+    const db = obtenerDb();
+    db.prepare(`UPDATE pmo_ejecuciones SET resultado = ?, estado = ?, ts_fin = ? WHERE id = ?`)
+      .run(resultado.output.slice(0, 10000), resultado.ok ? 'completado' : 'error', Date.now(), ejecId);
+
+    const icon = resultado.ok ? '✅' : '❌';
+
+    // Capa 7: Contar archivos modificados vs estado previo al fix.
+    // Si Claude hizo commit (caso normal): comparar HEAD contra el stash (estado original).
+    // Si no hay stash: comparar working tree vs HEAD (cambios sin commitear).
+    let alertaArchivos = '';
+    if (resultado.ok) {
+      try {
+        const diffCmd = stashLabel
+          ? 'git diff --stat stash@{0} HEAD 2>&1'   // cambios vs estado pre-fix
+          : 'git diff --stat HEAD 2>&1';             // fallback: sin commit
+        const diffStat = execSync(
+          diffCmd,
+          { cwd: config.root, timeout: 10000, encoding: 'utf8', stdio: 'pipe' }
+        ).trim();
+        const changedFiles = diffStat.split('\n').filter(l => l.includes('|')).length;
+        if (changedFiles > MAX_FILES_PER_FIX) {
+          alertaArchivos = `\n\n⚠️ ${changedFiles} archivos modificados (máx esperado: ${MAX_FILES_PER_FIX}). Revisa:\n${diffStat.slice(0, 600)}`;
+          log(`[aplicarFix] ${proyectoNombre} — ALERTA: ${changedFiles} archivos modificados`);
+        }
+      } catch {}
+    }
+
+    const revertirInfo = stashLabel
+      ? `Para revertir todo: git stash pop (stash: ${stashLabel.slice(-30)})`
+      : `Para revertir: responde "revertir ${proyectoNombre}"`;
+
+    encolarRespuesta(
+      `${icon} AUTOCORRECT [${proyectoNombre}] — ${resultado.ok ? 'Fix aplicado' : 'Error al aplicar'}\n\n` +
+      `${resultado.output.slice(0, 3000)}${alertaArchivos}\n\n` +
+      revertirInfo,
+      'pmo'
+    );
+
+  } catch (err) {
+    encolarRespuesta(`❌ AUTOCORRECT [${proyectoNombre}] — Error aplicando fix: ${err.message}`, 'pmo');
+  } finally {
+    ejecutando--;
+    proyectosEjecutando.delete(proyectoNombre);
+  }
+}
+
+async function revertirFix(prop) {
+  const { proyecto: proyectoNombre, config, stashLabel } = prop;
+  log(`[revertir] ${proyectoNombre} — Revirtiendo cambios...`);
+  encolarRespuesta(`🔄 Revirtiendo cambios en ${proyectoNombre}...`, 'pmo');
+
+  // Si el fix hizo git stash (Layer 3), revertir con stash pop — no depende de la IA
+  if (stashLabel) {
+    try {
+      const out = execSync(
+        'git stash pop',
+        { cwd: config.root, timeout: 15000, encoding: 'utf8', stdio: 'pipe' }
+      ).trim();
+      log(`[revertir] ${proyectoNombre} — git stash pop OK`);
+      encolarRespuesta(`✅ Revertir [${proyectoNombre}]: cambios revertidos via git stash pop\n\n${out.slice(0, 800)}`, 'pmo');
+      return;
+    } catch (err) {
+      log(`[revertir] ${proyectoNombre} — git stash pop falló: ${err.message.slice(0, 100)}`);
+      encolarRespuesta(`⚠️ git stash pop falló (${err.message.slice(0, 80)}). Intentando con Claude...`, 'pmo');
+    }
+  }
+
+  // Fallback: pedir a Claude que revierta
+  resetSesionProyecto(config.mcp);
+  try {
+    const resultado = await ejecutarClaude({
+      promptFile: 'pmo-instruction.md',
+      userPrompt: [
+        `Proyecto: ${proyectoNombre}`,
+        `PM2: ${config.pm2}`,
+        `Directorio: ${config.root}`,
+        `MCP Server: ${config.mcp}`,
+        '',
+        'INSTRUCCIÓN: Revierte TODOS los cambios no commiteados con git checkout . y reinicia el proceso.',
+        'Si no tiene git, reporta qué archivos fueron modificados.',
+      ].join('\n'),
+      projectName: config.mcp,
+      cwd: config.root,
+    });
+    encolarRespuesta(`${resultado.ok ? '✅' : '❌'} Revertir [${proyectoNombre}]: ${resultado.output.slice(0, 3000)}`, 'pmo');
+  } catch (err) {
+    encolarRespuesta(`❌ Error revirtiendo ${proyectoNombre}: ${err.message}`, 'pmo');
+  }
+}
+
+// ── Procesar autocorrección (trigger del monitor) ─────────────────────────
+
+async function procesarAutocorrect(item) {
+  const partes = item.mensaje.split('|');
+  if (partes.length < 3) {
+    log(`Autocorrect: formato inválido — ${item.mensaje.slice(0, 100)}`);
+    return;
+  }
+
+  const proyectoNombre = partes[1].trim();
+  const errorDetails   = sanitizarErrorDetails(partes.slice(2).join('|')); // Capa 1
+  const config         = PROYECTOS[proyectoNombre];
+
+  if (!config) {
+    log(`Autocorrect: proyecto desconocido — ${proyectoNombre}`);
+    encolarRespuesta(`AUTOCORRECT — Proyecto "${proyectoNombre}" no reconocido`, 'pmo');
+    return true; // procesado (error, no reintentar)
+  }
+
+  if (enCooldown(proyectoNombre)) {
+    log(`Autocorrect: ${proyectoNombre} en cooldown, ignorando`);
+    return false; // NO procesado, reintentar después
+  }
+
+  if (ejecutando >= MAX_CONCURRENT) {
+    log(`Autocorrect: ya hay ejecución en curso, posponiendo`);
+    return false; // NO procesado, reintentar después
+  }
+
+  ejecutando++;
+  proyectosEjecutando.add(proyectoNombre);
+  cooldowns.set(proyectoNombre, Date.now());
+
+  const ejecId = generarId('autocorrect');
+  const db = obtenerDb();
+
+  db.prepare(`
+    INSERT INTO pmo_ejecuciones (id, tipo, proyecto, instruccion, estado, ts_inicio)
+    VALUES (?, 'autocorrect', ?, ?, 'diagnosticando', ?)
+  `).run(ejecId, proyectoNombre, errorDetails.slice(0, 5000), Date.now());
+
+  const tsInicio = Date.now();
+  log(`[autocorrect] ${proyectoNombre} — Fase 1: Diagnosticando...`);
+  encolarRespuesta(`🔍 AUTOCORRECT [${proyectoNombre}] — Diagnosticando...\n\n⚠️ Error: ${errorDetails.slice(0, 200)}`, 'pmo');
+
+  try {
+    // ── FASE 1: Solo diagnosticar, NO corregir ──────────────────────────
+    const resultado = await ejecutarClaude({
+      promptFile: 'autocorrect-diagnostico.md',
+      userPrompt: [
+        `Proyecto: ${proyectoNombre}`,
+        `PM2: ${config.pm2}`,
+        `Directorio: ${config.root}`,
+        config.puerto ? `Puerto HTTP: ${config.puerto}` : '',
+        `MCP Server: ${config.mcp}`,
+        '',
+        'Error detectado:',
+        errorDetails,
+        '',
+        `Usa las herramientas del MCP server "${config.mcp}" para diagnosticar.`,
+      ].filter(Boolean).join('\n'),
+      projectName: config.mcp,
+      cwd: config.root,
+      timeout: CLAUDE_TIMEOUT_DIAGNOSTICO_MS,
     });
 
     const elapsed = Math.round((Date.now() - tsInicio) / 1000);
+    const diagnostico = resultado.output || '(sin diagnóstico)';
 
-    db.prepare(`
-      UPDATE pmo_ejecuciones SET resultado = ?, estado = ?, ts_fin = ? WHERE id = ?
-    `).run(resultado.output.slice(0, 10000), resultado.ok ? 'completado' : 'error', Date.now(), ejecId);
+    log(`[autocorrect] ${proyectoNombre} — Diagnóstico completado (${elapsed}s)`);
 
-    const icon = resultado.ok ? '✅' : '❌';
-    const reporte = `${icon} AUTOCORRECT [${proyectoNombre}] — ${resultado.ok ? 'Completado' : 'Fallo'} (${elapsed}s)\n\n${resultado.output.slice(0, 3800)}`;
-    encolarRespuesta(reporte, 'pmo');
-    log(`Autocorrect completado: ${resultado.ok ? 'OK' : 'ERROR'} (${elapsed}s)`);
+    // Capa 5: Abortar si el diagnóstico no tiene contenido útil (alucinación)
+    if (!diagnosticoValido(diagnostico)) {
+      log(`[autocorrect] ${proyectoNombre} — Diagnóstico inválido o vacío. Abortando.`);
+      encolarRespuesta(
+        `⚠️ AUTOCORRECT [${proyectoNombre}] — Diagnóstico insuficiente (${diagnostico.length} chars).\n` +
+        `El modelo no identificó causa concreta. Revisa manualmente.\n\n` +
+        `Respuesta: ${diagnostico.slice(0, 400)}`,
+        'pmo'
+      );
+      db.prepare(`UPDATE pmo_ejecuciones SET resultado = ?, estado = 'abortado', ts_fin = ? WHERE id = ?`)
+        .run(diagnostico.slice(0, 10000), Date.now(), ejecId);
+      return true;
+    }
+
+    // Guardar diagnóstico
+    db.prepare(`UPDATE pmo_ejecuciones SET resultado = ?, estado = 'propuesta' WHERE id = ?`)
+      .run(diagnostico.slice(0, 10000), ejecId);
+
+    // ── FASE 2: Proponer con timeout ────────────────────────────────────
+    const timeoutMs = config.critico ? APROBACION_CRITICO_MS : APROBACION_NO_CRIT_MS;
+    const timeoutMin = Math.round(timeoutMs / 60000);
+    const propId = generarId('prop');
+
+    // Capa 5b: parsear formato estructurado y bloquear severidad BAJO
+    const diagParseado = parsearDiagnostico(diagnostico);
+    if (diagParseado && diagParseado.severidad === 'BAJO') {
+      log(`[autocorrect] ${proyectoNombre} — Severidad BAJO. No se propone fix automático.`);
+      encolarRespuesta(
+        `ℹ️ AUTOCORRECT [${proyectoNombre}] — Severidad BAJO\n\n` +
+        `${diagParseado.descripcion}\n\nFix sugerido: ${diagParseado.fixPropuesto}\n\n` +
+        `No se aplica automáticamente. Usa !pmo si quieres proceder.`,
+        'pmo'
+      );
+      db.prepare(`UPDATE pmo_ejecuciones SET resultado = ?, estado = 'bajo_severidad', ts_fin = ? WHERE id = ?`)
+        .run(diagnostico.slice(0, 10000), Date.now(), ejecId);
+      return true;
+    }
+
+    // Capa 6: propIdCorto incluye prefijo del proyecto para evitar confusión cruzada
+    const abrevProyecto = proyectoNombre.replace(/[^a-zA-Z0-9]/g, '').slice(0, 5).toUpperCase();
+    const propIdCorto = `${abrevProyecto}-${propId.slice(-6)}`;
+
+    const diagLimpio = diagnostico.replace(/```[\s\S]*?```/g, '').replace(/`/g, '').replace(/[*_\[]/g, '').slice(0, 2500);
+
+    // Capa 4: Mensaje distinto según criticidad
+    const autoAplicaMsg = config.critico
+      ? `⏱️ Auto-aplica en ${timeoutMin} min si no respondes (servicio crítico).`
+      : `⚠️ Servicio NO crítico — NO se aplica automáticamente. Responde para actuar.`;
+
+    encolarRespuesta(
+      `🔍 AUTOCORRECT [${proyectoNombre}] — Propuesta #${propIdCorto}\n\n` +
+      `${diagLimpio}\n\n` +
+      `${autoAplicaMsg}\n` +
+      `!!!AUTOCORRECT_BOTONES:${propIdCorto}!!!`,
+      'pmo'
+    );
+
+    // Programar timeout
+    const timer = setTimeout(() => {
+      if (!config.critico) {
+        // Capa 4: No-crítico → NO auto-aplicar, solo notificar expiración
+        log(`[autocorrect] ${proyectoNombre} — Timeout ${timeoutMin}min. No crítico → NO auto-aplicando`);
+        encolarRespuesta(
+          `⏰ AUTOCORRECT [${proyectoNombre}] — Propuesta #${propIdCorto} expiró sin respuesta.\n` +
+          `Servicio no crítico: no se aplicó automáticamente.\n` +
+          `Para aplicar: !pmo aplicar ${propIdCorto}`,
+          'pmo'
+        );
+        propuestasPendientes.delete(propId);
+        propuestasPendientes.delete(propIdCorto);
+        db.prepare(`UPDATE pmo_ejecuciones SET estado = 'expirado', ts_fin = ? WHERE id = ?`).run(Date.now(), ejecId);
+        return;
+      }
+      // Crítico → auto-aplicar
+      log(`[autocorrect] ${proyectoNombre} — Timeout ${timeoutMin}min. Auto-aplicando...`);
+      encolarRespuesta(`⏰ AUTOCORRECT [${proyectoNombre}] — Timeout. Aplicando automáticamente...`, 'pmo');
+      propuestasPendientes.delete(propId);
+      propuestasPendientes.delete(propIdCorto);
+      aplicarFix({ proyecto: proyectoNombre, config, diagnostico, ejecId, errorDetails })
+        .catch(err => log(`Error auto-aplicando: ${err.message}`));
+    }, timeoutMs);
+
+    // Guardar propuesta — almacenamos ambas claves en propData para poder borrarlas ambas al responder
+    const propData = {
+      proyecto: proyectoNombre,
+      config,
+      diagnostico,
+      ejecId,
+      errorDetails,
+      timer,
+      creadoEn: Date.now(),
+      propId,       // clave larga (para cleanup)
+      propIdCorto,  // clave corta (para cleanup)
+    };
+    propuestasPendientes.set(propId, propData);
+    propuestasPendientes.set(propIdCorto, propData); // Capa 6: clave con prefijo de proyecto
+
+    log(`[autocorrect] ${proyectoNombre} — Propuesta ${propIdCorto} creada. Timeout: ${timeoutMin}min`);
 
   } catch (err) {
-    const elapsed = Math.round((Date.now() - tsInicio) / 1000);
-    log(`Error en autocorrect: ${err.message}`);
-    encolarRespuesta(`❌ AUTOCORRECT [${proyectoNombre}] — ERROR INTERNO (${elapsed}s)\n\n${err.message}`, 'pmo');
-    db.prepare(`
-      UPDATE pmo_ejecuciones SET resultado = ?, estado = 'error', ts_fin = ? WHERE id = ?
-    `).run(err.message, Date.now(), ejecId);
+    log(`Error en diagnóstico: ${err.message}`);
+    encolarRespuesta(`❌ AUTOCORRECT [${proyectoNombre}] — Error diagnóstico: ${err.message}`, 'pmo');
+    db.prepare(`UPDATE pmo_ejecuciones SET resultado = ?, estado = 'error', ts_fin = ? WHERE id = ?`)
+      .run(err.message, Date.now(), ejecId);
   } finally {
     ejecutando--;
+    proyectosEjecutando.delete(proyectoNombre);
   }
+
+  return true; // procesado
 }
 
 // ── Ciclo principal ───────────────────────────────────────────────────────
 
 async function procesarCola() {
-  if (ejecutando >= MAX_CONCURRENT) return;
-
   const db = obtenerDb();
 
-  // 1. Buscar instrucciones PMO del admin (mensajes_responses con id que empieza con 'pmo')
-  const instrucciones = db.prepare(`
-    SELECT rowid, * FROM mensajes_responses
-    WHERE id LIKE 'pmo%' AND procesado = 0
-    ORDER BY ts ASC LIMIT 1
-  `).all();
+  // 1. Buscar hasta 5 instrucciones PMO del admin y lanzarlas en paralelo por proyecto
+  if (ejecutando < MAX_CONCURRENT) {
+    const instrucciones = db.prepare(`
+      SELECT rowid, * FROM mensajes_responses
+      WHERE id LIKE 'pmo%' AND procesado = 0
+      ORDER BY ts ASC LIMIT 5
+    `).all();
 
-  for (const instr of instrucciones) {
-    try {
-      await procesarInstruccionPMO(instr.texto);
-    } catch (err) {
-      log(`Error procesando instrucción PMO: ${err.message}`);
-      encolarRespuesta(`❌ PMO — Error interno: ${err.message}`, 'pmo');
-    } finally {
-      // Marcar procesado DESPUÉS de ejecutar (exitoso o no) para no re-procesar
+    for (const instr of instrucciones) {
+      if (ejecutando >= MAX_CONCURRENT) break;
+
+      // Detectar proyecto para evitar lanzar dos ejecuciones del mismo proyecto
+      const topicMatch = instr.id.match(/^pmo-t(\d+)-/);
+      let proyectoNombre = null;
+      if (topicMatch) {
+        const topicConfig = TOPICS[parseInt(topicMatch[1])];
+        proyectoNombre = topicConfig?.proyecto;
+      } else {
+        const p = identificarProyecto(instr.texto);
+        proyectoNombre = p?.nombre;
+      }
+
+      // Saltar si ese proyecto ya tiene una ejecución activa
+      if (proyectoNombre && proyectosEjecutando.has(proyectoNombre)) continue;
+
+      // Marcar como procesado antes de lanzar para no re-tomarlo en el próximo poll
       db.prepare(`UPDATE mensajes_responses SET procesado = 1 WHERE rowid = ?`).run(instr.rowid);
+
+      // Lanzar sin await — ejecución paralela real
+      if (topicMatch) {
+        procesarMensajeTopic(parseInt(topicMatch[1]), instr.texto)
+          .catch(err => {
+            log(`Error procesando topic: ${err.message}`);
+            encolarRespuesta(`❌ PMO — Error interno: ${err.message}`, 'pmo');
+          });
+      } else {
+        procesarInstruccionPMO(instr.texto)
+          .catch(err => {
+            log(`Error procesando instrucción PMO: ${err.message}`);
+            encolarRespuesta(`❌ PMO — Error interno: ${err.message}`, 'pmo');
+          });
+      }
     }
   }
 
   // 2. Buscar autocorrecciones del monitor (mensajes_queue con origen='autocorrect')
-  const autocorrects = db.prepare(`
-    SELECT * FROM mensajes_queue
-    WHERE origen = 'autocorrect' AND enviado = 0
-    ORDER BY ts ASC LIMIT 1
-  `).all();
+  if (ejecutando < MAX_CONCURRENT) {
+    const autocorrects = db.prepare(`
+      SELECT * FROM mensajes_queue
+      WHERE origen = 'autocorrect' AND enviado = 0
+      ORDER BY ts ASC LIMIT 1
+    `).all();
 
-  for (const item of autocorrects) {
-    try {
-      await procesarAutocorrect(item);
-    } catch (err) {
-      log(`Error procesando autocorrect: ${err.message}`);
-      encolarRespuesta(`❌ AUTOCORRECT — Error interno: ${err.message}`, 'pmo');
-    } finally {
-      db.prepare(`UPDATE mensajes_queue SET enviado = 1 WHERE id = ?`).run(item.id);
+    for (const item of autocorrects) {
+      if (ejecutando >= MAX_CONCURRENT) break;
+      try {
+        const procesado = await procesarAutocorrect(item);
+        if (procesado) {
+          db.prepare(`UPDATE mensajes_queue SET enviado = 1 WHERE id = ?`).run(item.id);
+        }
+        // Si no se procesó (cooldown/concurrencia), dejarlo pendiente para reintento
+      } catch (err) {
+        log(`Error procesando autocorrect: ${err.message}`);
+        encolarRespuesta(`❌ AUTOCORRECT — Error interno: ${err.message}`, 'pmo');
+        db.prepare(`UPDATE mensajes_queue SET enviado = 1 WHERE id = ?`).run(item.id);
+      }
     }
   }
 }
@@ -461,7 +911,24 @@ function iniciar() {
   log(`Cooldown: ${COOLDOWN_MS / 1000}s entre correcciones del mismo servicio`);
 
   // Inicializar DB
-  obtenerDb();
+  const db = obtenerDb();
+
+  // Recovery: marcar ejecuciones que quedaron colgadas en un reinicio anterior
+  const colgadas = db.prepare(`
+    SELECT id FROM pmo_ejecuciones
+    WHERE estado IN ('ejecutando', 'diagnosticando')
+  `).all();
+  if (colgadas.length > 0) {
+    db.prepare(`
+      UPDATE pmo_ejecuciones SET estado = 'interrumpido', ts_fin = ?
+      WHERE estado IN ('ejecutando', 'diagnosticando')
+    `).run(Date.now());
+    log(`Recovery: ${colgadas.length} ejecución(es) interrumpidas por reinicio`);
+    encolarRespuesta(
+      `⚠️ PMO reiniciado. ${colgadas.length} ejecución(es) quedaron incompletas — re-envía tus órdenes si es necesario.`,
+      'pmo'
+    );
+  }
 
   // Ciclo de polling
   setInterval(async () => {

@@ -925,18 +925,42 @@ async def handle_run_command(args: dict) -> str:
     command = args["command"]
     timeout = min(args.get("timeout", 60), 120)
 
-    # Bloquear comandos peligrosos
-    dangerous = ["rm -rf /", "format ", "del /s /q", "rmdir /s", "shutdown", "reboot"]
+    # ── Capa 2: Blocklist expandida ────────────────────────────────────────
+    # Substrings que se bloquean directamente
+    BLOCKED_SUBSTRINGS = [
+        "rm -rf /", "rm -rf ~", "rm -fr /", "rm -fr ~",
+        "format ", "mkformat ",
+        "del /s /q", "rmdir /s /q",
+        "shutdown", "reboot", "halt", "poweroff",
+        ":(){:|:&};:",          # fork bomb
+        "DROP TABLE", "DROP DATABASE", "TRUNCATE TABLE",
+        "chmod 777",            # permisos inseguros en producción
+        "chown -R",             # cambio masivo de propietario
+        "npm install -g",       # instalación global no supervisada
+        "> /etc/",              # sobreescribir archivos del sistema
+        "mkfs",                 # formatear partición
+    ]
+
+    # Patrones regex para comportamientos de pipeline peligrosos
+    BLOCKED_PATTERNS_RE = [
+        r"curl\s+.*\|\s*(bash|sh|python\d*|node)",   # descargar y ejecutar
+        r"wget\s+.*\|\s*(bash|sh|python\d*|node)",
+        r"(bash|sh)\s+<\s*\(",                        # process substitution
+        r"eval\s+['\"`]?\$[\(\{]",                   # eval dinámico
+        r"\.\./\.\./\.\./",                           # path traversal profundo
+    ]
+
     cmd_lower = command.lower()
-    for d in dangerous:
-        if d in cmd_lower:
-            return f"ERROR: Comando bloqueado por seguridad: contiene '{d}'"
 
-    if sys.platform == "win32":
-        cmd = ["bash", "-c", command]
-    else:
-        cmd = ["bash", "-c", command]
+    for blocked in BLOCKED_SUBSTRINGS:
+        if blocked.lower() in cmd_lower:
+            return f"ERROR: Comando bloqueado por seguridad: contiene '{blocked}'"
 
+    for pattern in BLOCKED_PATTERNS_RE:
+        if re.search(pattern, command, re.IGNORECASE):
+            return f"ERROR: Comando bloqueado por seguridad: patrón peligroso detectado"
+
+    cmd = ["bash", "-c", command]
     output = _run_cmd(cmd, PROJECT_ROOT, timeout=timeout)
     return f"# Comando: {command}\n\n{output}"
 

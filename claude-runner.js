@@ -6,7 +6,7 @@
  * Optimizaciones (inspiradas en orquestador/monitor):
  *   1. MCP config dinámico: solo carga el server del proyecto target (no los 6)
  *   2. Cache de system prompts: lee .md una vez, invalida por mtime
- *   3. Sesiones de 1 hora con --session-id / --resume
+ *   3. Sesiones de 1 hora por proyecto con --session-id (create-or-resume)
  *   4. Guard anti-reentrancia
  *   5. Cleanup de procesos huérfanos
  */
@@ -21,6 +21,11 @@ const {
   PROMPTS_DIR,
   CLAUDE_TIMEOUT_MS,
 } = require('./config');
+
+function log(msg) {
+  const ahora = new Date().toLocaleString('es-MX', { timeZone: 'America/Hermosillo' });
+  console.log(`[${ahora}] [claude-runner] ${msg}`);
+}
 
 // ── Cache de system prompts (invalida por mtime) ─────────────────────────
 
@@ -69,17 +74,20 @@ function getMcpConfigParaProyecto(projectName) {
   return tmpFile;
 }
 
-// ── Sesiones (1 hora de vida) ─────────────────────────────────────────────
+// ── Sesiones (1 hora de vida, máx 8 mensajes por sesión) ─────────────────
 
-const SESSION_TTL_MS = 60 * 60 * 1000;
+const SESSION_TTL_MS       = 60 * 60 * 1000;
+const SESSION_MAX_MENSAJES = 8; // reset al superar este límite (evita budget agotado por contexto acumulado)
 const sesionesActivas = new Map();
 
-function obtenerOCrearSesion() {
-  const key = 'global';
+function obtenerOCrearSesion(projectName) {
+  const key = projectName || 'global';
   const ahora = Date.now();
   const existente = sesionesActivas.get(key);
 
-  if (existente && (ahora - existente.creadoEn) < SESSION_TTL_MS) {
+  if (existente &&
+      (ahora - existente.creadoEn) < SESSION_TTL_MS &&
+      existente.mensajes < SESSION_MAX_MENSAJES) {
     existente.ultimoUso = ahora;
     return { sessionId: existente.sessionId, esNueva: false, sesion: existente };
   }
@@ -90,8 +98,8 @@ function obtenerOCrearSesion() {
   return { sessionId, esNueva: true, sesion: nueva };
 }
 
-function getSesionInfo() {
-  const existente = sesionesActivas.get('global');
+function getSesionInfo(projectKey) {
+  const existente = sesionesActivas.get(projectKey || 'global');
   if (!existente) return null;
   const ahora = Date.now();
   if ((ahora - existente.creadoEn) >= SESSION_TTL_MS) return null;
@@ -104,8 +112,86 @@ function getSesionInfo() {
   };
 }
 
+function getAllSesionesInfo() {
+  const ahora = Date.now();
+  const result = [];
+  for (const [key, sesion] of sesionesActivas.entries()) {
+    if ((ahora - sesion.creadoEn) < SESSION_TTL_MS) {
+      result.push({
+        key,
+        mensajes: sesion.mensajes,
+        restanteMin: Math.round((SESSION_TTL_MS - (ahora - sesion.creadoEn)) / 60000),
+      });
+    }
+  }
+  return result;
+}
+
 function resetSesion() {
-  sesionesActivas.delete('global');
+  sesionesActivas.clear();
+}
+
+function resetSesionProyecto(projectName) {
+  sesionesActivas.delete(projectName || 'global');
+}
+
+// ── Parser de eventos stream-json ────────────────────────────────────────
+
+const TOOL_ICONS = {
+  read_file: '📂', write_file: '✍️', edit_file: '✏️',
+  search_code: '🔍', list_files: '📋', get_project_structure: '🗂️',
+  run_command: '⚡', restart_process: '🔄', view_logs: '📜',
+  git_commit: '📝', git_diff: '🔀', git_status: '📊',
+  run_tests: '🧪', check_health: '💓', start_process: '▶️',
+  stop_process: '⏹️', get_status: '📡',
+};
+
+function procesarEventoJSON(event, finalOutputRef, progress) {
+  try {
+    switch (event.type) {
+      case 'system':
+        if (event.subtype === 'init') {
+          const servers = (event.mcp_servers || []).map(s => s.name).join(', ');
+          log(`  🔌 MCP: ${servers || '(ninguno)'}`);
+        }
+        break;
+
+      case 'assistant':
+        for (const block of (event.message?.content || [])) {
+          if (block.type === 'thinking' && block.thinking) {
+            log(`  💭 [thinking] ${block.thinking.slice(0, 400)}`);
+          } else if (block.type === 'tool_use') {
+            const icon = TOOL_ICONS[block.name] || '🔧';
+            const input = JSON.stringify(block.input || {});
+            log(`  ${icon} [tool] ${block.name} — ${input.slice(0, 300)}`);
+            progress(`${icon} ${block.name}...`);
+          } else if (block.type === 'text' && block.text?.trim()) {
+            log(`  💬 [text] ${block.text.slice(0, 300)}`);
+          }
+        }
+        break;
+
+      case 'tool_result': {
+        const content = Array.isArray(event.content)
+          ? event.content.map(c => c.text || '').join('').slice(0, 300)
+          : String(event.content || '').slice(0, 300);
+        const isError = event.is_error ? ' ❌ ERROR' : '';
+        log(`  ↩️ [tool_result]${isError} ${content}`);
+        if (event.is_error) progress('⚠️ Error en tool...');
+        break;
+      }
+
+      case 'result':
+        finalOutputRef.value = event.result || '';
+        if (event.cost_usd != null) {
+          log(`  💰 Costo: $${event.cost_usd.toFixed(4)}`);
+        }
+        if (event.subtype === 'error_max_turns') {
+          log(`  ⚠️ Alcanzó límite de turnos`);
+        }
+        break;
+    }
+  } catch {}
 }
 
 // ── Guard anti-reentrancia ────────────────────────────────────────────────
@@ -115,11 +201,21 @@ let _pidActual = null;
 
 function estaEjecutando() { return _ejecutando; }
 
-// ── Cleanup de procesos huérfanos ─────────────────────────────────────────
+// ── Matar árbol de procesos en Windows ────────────────────────────────────
+
+function matarArbol(pid) {
+  if (!pid) return;
+  try {
+    require('child_process').execSync(
+      `taskkill /F /T /PID ${pid}`,
+      { stdio: 'ignore' }
+    );
+  } catch {}
+}
 
 function limpiarProcesoHuerfano() {
   if (_pidActual) {
-    try { process.kill(_pidActual, 'SIGTERM'); } catch {}
+    matarArbol(_pidActual);
     _pidActual = null;
   }
 }
@@ -148,7 +244,7 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
     }
 
     // ── Sesión ──────────────────────────────────────────────────────────
-    const { sessionId, esNueva, sesion } = obtenerOCrearSesion();
+    const { sessionId, esNueva, sesion } = obtenerOCrearSesion(projectName);
     sesion.mensajes++;
     if (projectName) sesion.proyectos.add(projectName);
 
@@ -177,100 +273,140 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
     // ── Args ────────────────────────────────────────────────────────────
     const comspec = process.env.COMSPEC || 'C:\\Windows\\system32\\cmd.exe';
 
-    const sessionArg = esNueva
-      ? ['--session-id', sessionId]
-      : ['--resume', sessionId];
-
-    const claudeArgs = [
-      '/c', 'claude', '-p',
-      '--output-format', 'text',
-      '--model', 'sonnet',
-      ...sessionArg,
-      '--mcp-config', mcpConfigPath,
-      '--permission-mode', 'bypassPermissions',
-      '--max-budget-usd', '2.00',
-    ];
-
     progress('🧠 Pensando...');
 
-    // ── Spawn ───────────────────────────────────────────────────────────
-    return await new Promise((resolve) => {
-      let output   = '';
-      let stderrBuf = '';
-      let finished = false;
-      let lastProgressAt = Date.now();
-      let hasOutput = false;
+    // ── Escribir prompt + .bat temporal ────────────────────────────────
+    const tmpId = crypto.randomBytes(6).toString('hex');
+    const tmpPrompt = path.join(os.tmpdir(), `pmo-prompt-${tmpId}.txt`);
+    const tmpBat = path.join(os.tmpdir(), `pmo-run-${tmpId}.bat`);
 
-      const proc = spawn(comspec, claudeArgs, {
+    fs.writeFileSync(tmpPrompt, fullPrompt, 'utf-8');
+
+    // --session-id hace create-or-resume automáticamente, evita hang de --resume con sesión no encontrada
+    const sessionFlag = `--session-id ${sessionId}`;
+
+    const batContent = [
+      '@echo off',
+      `type "${tmpPrompt}" | claude -p ^`,
+      `  --output-format stream-json ^`,
+      `  --verbose ^`,
+      `  --model sonnet ^`,
+      `  ${sessionFlag} ^`,
+      `  --mcp-config "${mcpConfigPath}" ^`,
+      `  --strict-mcp-config ^`,
+      `  --permission-mode bypassPermissions ^`,
+      `  --max-turns 20 ^`,
+      `  --max-budget-usd 2.00`,
+    ].join('\r\n');
+
+    fs.writeFileSync(tmpBat, batContent, 'utf-8');
+
+    // procesarEventoJSON definido a nivel de módulo
+
+    // ── Spawn ───────────────────────────────────────────────────────────
+    // Watchdog por inactividad: solo dispara si no hay output durante INACTIVITY_MS.
+    // Si Claude está trabajando (datos fluyendo), el timer se resetea.
+    // Hard cap = timeoutMs para evitar ejecuciones infinitas.
+    const INACTIVITY_MS = 3 * 60 * 1000; // 3 min sin ningún byte → atascado
+
+    return await new Promise((resolve) => {
+      let rawOutput        = '';
+      let lineBuffer       = '';
+      let stderrBuf        = '';
+      let finished         = false;
+      let lastActivityAt   = Date.now();
+      const finalOutputRef = { value: '' }; // llenado por el evento 'result'
+
+      const proc = spawn(comspec, ['/c', tmpBat], {
         cwd,
         windowsHide: true,
         env: process.env,
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
 
       _pidActual = proc.pid;
 
-      // Enviar prompt por stdin
-      proc.stdin.write(fullPrompt);
-      proc.stdin.end();
-
       proc.stdout.on('data', (data) => {
+        lastActivityAt = Date.now(); // resetear watchdog con cada byte recibido
         const chunk = data.toString();
-        output += chunk;
+        rawOutput  += chunk;
+        lineBuffer += chunk;
 
-        if (!hasOutput) {
-          hasOutput = true;
-          progress('✏️ Escribiendo...');
-        }
-
-        const now = Date.now();
-        if (now - lastProgressAt > 8000) {
-          lastProgressAt = now;
-          const lower = output.toLowerCase();
-          if (lower.includes('edit_file') || lower.includes('editando')) {
-            progress('✏️ Editando código...');
-          } else if (lower.includes('read_file') || lower.includes('leyendo')) {
-            progress('📂 Leyendo archivos...');
-          } else if (lower.includes('search_code') || lower.includes('buscando')) {
-            progress('🔍 Buscando...');
-          } else if (lower.includes('restart') || lower.includes('reinici')) {
-            progress('🔄 Reiniciando...');
-          } else if (lower.includes('commit')) {
-            progress('📝 Commit...');
-          } else if (lower.includes('test')) {
-            progress('🧪 Tests...');
-          } else {
-            const kb = Math.round(output.length / 1024);
-            const secs = Math.round((now - (sesion.ultimoUso)) / 1000);
-            progress(`⏳ ${secs}s (${kb}KB)`);
-          }
+        // Parsear líneas completas de stream-json
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop(); // conservar línea incompleta
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const event = JSON.parse(line);
+            procesarEventoJSON(event, finalOutputRef, progress);
+          } catch {}
         }
       });
 
       proc.stderr.on('data', (data) => {
-        stderrBuf += data.toString();
+        lastActivityAt = Date.now(); // stderr también cuenta como actividad
+        const chunk = data.toString().trim();
+        if (chunk) {
+          stderrBuf += chunk + '\n';
+          log(`  ⚠️ [stderr] ${chunk.slice(0, 300)}`);
+        }
       });
 
-      const timer = setTimeout(() => {
-        if (!finished) {
+      // Watchdog: revisa cada 30s si hubo actividad reciente
+      const watchdog = setInterval(() => {
+        if (finished) { clearInterval(watchdog); return; }
+        const inactivoMs = Date.now() - lastActivityAt;
+        if (inactivoMs >= INACTIVITY_MS) {
+          clearInterval(watchdog);
+          clearTimeout(hardCap);
           finished = true;
-          try { proc.kill('SIGTERM'); } catch {}
+          matarArbol(proc.pid);
+          cleanup();
           _pidActual = null;
+          log(`  ⏱️ Inactividad ${Math.round(inactivoMs / 1000)}s — proceso cortado`);
           resolve({
             ok: false,
-            output: (output || stderrBuf).trim() + `\n\nTIMEOUT: ${timeoutMs / 1000}s`,
+            output: (finalOutputRef.value || rawOutput || stderrBuf).trim() +
+                    `\n\nTIMEOUT por inactividad: ${Math.round(inactivoMs / 1000)}s sin respuesta`,
+            exitCode: -2,
+            sessionId,
+          });
+        }
+      }, 30_000);
+
+      // Hard cap: límite absoluto para evitar ejecuciones infinitas
+      const hardCap = setTimeout(() => {
+        if (!finished) {
+          clearInterval(watchdog);
+          finished = true;
+          matarArbol(proc.pid);
+          cleanup();
+          _pidActual = null;
+          log(`  ⏱️ Hard cap alcanzado (${timeoutMs / 60000}min)`);
+          resolve({
+            ok: false,
+            output: (finalOutputRef.value || rawOutput || stderrBuf).trim() +
+                    `\n\nTIMEOUT hard cap: ${timeoutMs / 60000}min`,
             exitCode: -2,
             sessionId,
           });
         }
       }, timeoutMs);
 
+      function cleanup() {
+        try { fs.unlinkSync(tmpPrompt); } catch {}
+        try { fs.unlinkSync(tmpBat); } catch {}
+      }
+
       proc.on('close', (code) => {
         if (!finished) {
           finished = true;
-          clearTimeout(timer);
+          clearInterval(watchdog);
+          clearTimeout(hardCap);
+          cleanup();
           _pidActual = null;
-          let finalOutput = output.trim();
+          let finalOutput = finalOutputRef.value.trim();
           if (!finalOutput && stderrBuf.trim()) {
             finalOutput = stderrBuf.trim();
           }
@@ -286,7 +422,8 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
       proc.on('error', (err) => {
         if (!finished) {
           finished = true;
-          clearTimeout(timer);
+          clearInterval(watchdog);
+          clearTimeout(hardCap);
           _pidActual = null;
           resolve({
             ok: false,
@@ -302,4 +439,4 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
   }
 }
 
-module.exports = { ejecutarClaude, getSesionInfo, resetSesion, estaEjecutando };
+module.exports = { ejecutarClaude, getSesionInfo, getAllSesionesInfo, resetSesion, resetSesionProyecto, estaEjecutando };

@@ -107,7 +107,7 @@ Cada proyecto tiene su propia instancia del servidor MCP (Python), scoped a su d
 - Path traversal bloqueado (no se puede salir del directorio del proyecto)
 - Archivos sensibles bloqueados: `.env`, `*.pem`, `*.key`, `credentials.json`
 - Binarios excluidos (imágenes, ejecutables, bases de datos)
-- Comandos destructivos filtrados: `rm -rf /`, `format`, `shutdown`
+- Comandos destructivos filtrados: `rm -rf /`, `format`, `shutdown`, `curl|bash`, `eval $()`, fork bombs, `chmod 777` y más (13 substrings + 5 regex)
 - Máximo 500KB por archivo
 
 ## Atajos de Telegram
@@ -129,6 +129,46 @@ Cada proyecto tiene su propia instancia del servidor MCP (Python), scoped a su d
 
 Los atajos por proyecto aceptan instrucción directa: `/pmo_api agrega endpoint /health`
 
+## Seguridad anti-alucinación — Auto-healing
+
+El sistema de autocorrección tiene 7 capas para prevenir que la IA actúe sobre diagnósticos incorrectos o aplique cambios destructivos:
+
+| # | Capa | Protege contra |
+|---|------|---------------|
+| 1 | **Sanitizar input externo** | Prompt injection via Telegram o mensajes del monitor |
+| 2 | **Blocklist `run_command` expandida** | `curl\|bash`, `wget\|sh`, fork bombs, `chmod 777`, `eval $()` |
+| 3 | **Git stash antes del fix** | Fix sale mal → `git stash pop` sin depender de la IA |
+| 4 | **No auto-aplicar si no es crítico** | Servicios secundarios no se parchean solos por timeout |
+| 5 | **Validar diagnóstico estructurado** | Alucinación, respuesta vacía, severidad BAJO pasan a ser abortados |
+| 6 | **propId con prefijo de proyecto** | Confusión cruzada entre propuestas de distintos proyectos |
+| 7 | **Límite de archivos por fix** | Fix que toca >5 archivos activa alerta al admin |
+
+### Flujo de auto-healing con capas activas
+
+```
+Monitor detecta error
+    │  [Capa 1] sanitizarErrorDetails() — trunca + neutraliza inyecciones
+    ▼
+Fase 1: Diagnosticar (solo leer, NO editar)
+    │  autocorrect-diagnostico.md
+    │  [Capa 5] parsearDiagnostico() — valida formato DIAGNOSTICO|sev|...|fix
+    │  [Capa 5] Aborta si vacío, texto libre sin sentido, o severidad BAJO
+    ▼
+Proponer al admin con timeout
+    │  [Capa 6] propId = PROJ-a1b2c3 (prefijo de proyecto)
+    │  [Capa 4] Si no es crítico → NUNCA auto-aplicar al expirar
+    ▼
+Admin aprueba (o timeout en crítico)
+    │  [Capa 3] git stash push -u antes de cualquier cambio
+    ▼
+Fase 2: Aplicar fix
+    │  [Capa 2] run_command blocklist — bloquea comandos peligrosos
+    │  [Capa 7] git diff stash@{0} HEAD — alerta si >5 archivos modificados
+    ▼
+Admin puede revertir
+    └  git stash pop (determinista, sin IA)
+```
+
 ## Optimizaciones
 
 | Optimización | Detalle |
@@ -137,26 +177,33 @@ Los atajos por proyecto aceptan instrucción directa: `/pmo_api agrega endpoint 
 | Cache de system prompts | Lee .md una vez, invalida por mtime del archivo |
 | Guard anti-reentrancia | Previene ejecuciones duplicadas |
 | Cleanup de huérfanos | Mata procesos Claude que quedaron vivos |
-| Procesado en finally | Marca mensajes procesados después de ejecutar, no antes |
-| Monitor ignorar pmo | MonitorBot skip mensajes con id `pmo*` |
+| `--max-turns 20` | Limita tool calls por ejecución, evita loops de herramientas |
+| Sesiones 1h / 8 mensajes | Claude retiene contexto entre instrucciones del mismo proyecto |
+| Recovery al reiniciar | Marca como interrumpidas las ejecuciones que quedaron colgadas |
 
 ## Estructura
 
 ```
 pmo-agent/
-├── index.js              # Proceso principal: polling + dispatch
-├── claude-runner.js       # Wrapper para claude -p (spawn, sesiones, progreso)
-├── config.js              # Mapa de proyectos, rutas, tiempos
-├── mcp-projects.json      # Config MCP completo (6 proyectos)
-├── package.json           # Dependencia: better-sqlite3
-├── ecosystem.config.js    # Config PM2
+├── index.js                    # Proceso principal: polling + dispatch
+├── claude-runner.js             # Wrapper para claude -p (spawn, sesiones, progreso)
+├── config.js                    # Mapa de proyectos, rutas, tiempos, constantes de seguridad
+├── mcp-projects.json            # Config MCP completo (6 proyectos)
+├── package.json                 # Dependencia: better-sqlite3
+├── ecosystem.config.js          # Config PM2
 ├── prompts/
-│   ├── autocorrect.md     # System prompt: corrección automática
-│   └── pmo-instruction.md # System prompt: instrucciones del admin
-└── state/                 # Estado interno (cooldowns)
+│   ├── autocorrect-diagnostico.md  # System prompt fase 1: solo diagnosticar
+│   ├── autocorrect.md              # System prompt fase 2: aplicar fix
+│   ├── pmo-instruction.md          # System prompt: instrucciones del admin
+│   ├── topic-bot.md                # System prompt para thread TacosAragon
+│   ├── topic-api.md                # System prompt para thread tacos-api
+│   ├── topic-cfo.md                # System prompt para thread cfo-agent
+│   ├── topic-monitor.md            # System prompt para thread MonitorBot
+│   └── topic-general.md            # System prompt para thread General
+└── state/                          # Estado interno (cooldowns)
 
 ../mcp-project-server/
-└── server.py              # 24 herramientas MCP (1,064 líneas)
+└── server.py                    # 24 herramientas MCP (blocklist expandida)
 ```
 
 ## Configuración
@@ -164,10 +211,18 @@ pmo-agent/
 | Parámetro | Valor | Descripción |
 |---|---|---|
 | `POLL_INTERVAL_MS` | 10,000 (10s) | Frecuencia de polling a SQLite |
-| `CLAUDE_TIMEOUT_MS` | 1,200,000 (20min) | Timeout para claude -p |
-| `MAX_CONCURRENT` | 1 | Ejecuciones simultáneas |
+| `CLAUDE_TIMEOUT_MS` | 600,000 (10min) | Timeout hard cap para claude -p |
+| `CLAUDE_TIMEOUT_INSTRUCCION_MS` | 300,000 (5min) | Timeout instrucciones PMO simples |
+| `CLAUDE_TIMEOUT_DIAGNOSTICO_MS` | 180,000 (3min) | Timeout diagnóstico autocorrect |
+| `CLAUDE_TIMEOUT_FIX_MS` | 480,000 (8min) | Timeout aplicar/revertir fix |
+| `MAX_CONCURRENT` | 3 | Proyectos distintos en paralelo |
 | `COOLDOWN_MS` | 300,000 (5min) | Cooldown entre correcciones mismo servicio |
+| `APROBACION_CRITICO_MS` | 900,000 (15min) | Timeout propuesta servicios críticos |
+| `APROBACION_NO_CRIT_MS` | 300,000 (5min) | Timeout propuesta servicios no críticos |
 | `SESSION_TTL_MS` | 3,600,000 (1h) | Duración de sesiones con contexto |
+| `MAX_ERROR_DETAILS_CHARS` | 1,000 | Máx chars del payload de error del monitor |
+| `MIN_DIAGNOSTICO_CHARS` | 150 | Mínimo chars para diagnóstico válido |
+| `MAX_FILES_PER_FIX` | 5 | Máx archivos que un autocorrect puede modificar |
 
 ## Agregar un nuevo proyecto
 
