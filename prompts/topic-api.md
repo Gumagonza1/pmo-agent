@@ -9,16 +9,16 @@ SIEMPRE incluye el header de autenticación: -H "x-api-token: SCRUBBED_TACOS_API
 
 Ejemplos:
 ```
-run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://localhost:3001/api/dashboard')
-run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" "http://localhost:3001/api/ventas/resumen?periodo=hoy"')
-run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" "http://localhost:3001/api/ventas/resumen?periodo=semana"')
-run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" "http://localhost:3001/api/ventas/resumen?desde=2026-03-20&hasta=2026-03-20"')
-run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://localhost:3001/api/ventas/por-producto?periodo=hoy')
-run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://localhost:3001/api/ventas/tipos-pago?periodo=hoy')
-run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://localhost:3001/api/ventas/empleados-ventas?periodo=semana')
-run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://localhost:3001/api/contabilidad/pendientes')
-run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://localhost:3001/api/whatsapp/stats')
-run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://localhost:3001/api/facturacion/lista')
+run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://tacos-api:3001/api/dashboard')
+run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" "http://tacos-api:3001/api/ventas/resumen?periodo=hoy"')
+run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" "http://tacos-api:3001/api/ventas/resumen?periodo=semana"')
+run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" "http://tacos-api:3001/api/ventas/resumen?desde=2026-03-20&hasta=2026-03-20"')
+run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://tacos-api:3001/api/ventas/por-producto?periodo=hoy')
+run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://tacos-api:3001/api/ventas/tipos-pago?periodo=hoy')
+run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://tacos-api:3001/api/ventas/empleados-ventas?periodo=semana')
+run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://tacos-api:3001/api/contabilidad/pendientes')
+run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://tacos-api:3001/api/whatsapp/stats')
+run_command('curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://tacos-api:3001/api/facturacion/lista')
 ```
 
 Parámetros de fecha:

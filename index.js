@@ -28,7 +28,54 @@ const path     = require('path');
 const crypto   = require('crypto');
 
 const { execSync } = require('child_process');
-const { ejecutarClaude, getSesionInfo, getAllSesionesInfo, resetSesion, resetSesionProyecto, estaEjecutando } = require('./claude-runner');
+
+// ── Historial de cambios ──────────────────────────────────────────────────
+const CHANGELOG_DIR = 'C:/SesionBot/changelogs';
+
+function obtenerCambiosRecientes(limit = 15) {
+  try {
+    if (!fs.existsSync(CHANGELOG_DIR)) return '';
+    const files = fs.readdirSync(CHANGELOG_DIR).filter(f => f.endsWith('.jsonl'));
+    const entries = [];
+    for (const file of files) {
+      const lines = fs.readFileSync(path.join(CHANGELOG_DIR, file), 'utf8').split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { entries.push(JSON.parse(line)); } catch {}
+      }
+    }
+    entries.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+    const recent = entries.slice(0, limit);
+    if (recent.length === 0) return '';
+    return recent.map(e =>
+      `[${e.ts}] ${e.agente} (${e.origen}): ${e.titulo} | ${e.desc?.slice(0, 120)} | tags: ${(e.tags||[]).join(',')}`
+    ).join('\n');
+  } catch {
+    return '';
+  }
+}
+
+function contarEntradasDesde(tsInicio) {
+  try {
+    if (!fs.existsSync(CHANGELOG_DIR)) return 0;
+    const files = fs.readdirSync(CHANGELOG_DIR).filter(f => f.endsWith('.jsonl'));
+    let count = 0;
+    for (const file of files) {
+      const lines = fs.readFileSync(path.join(CHANGELOG_DIR, file), 'utf8').split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const e = JSON.parse(line);
+          if (e.ts && new Date(e.ts).getTime() >= tsInicio) count++;
+        } catch {}
+      }
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+const { ejecutarClaude, getSesionInfo, getAllSesionesInfo, resetSesion, resetSesionProyecto, estaEjecutando, limpiarProcesoHuerfano } = require('./claude-runner');
 const {
   PROYECTOS,
   TOPICS,
@@ -46,6 +93,13 @@ const {
   MIN_DIAGNOSTICO_CHARS,
   MAX_FILES_PER_FIX,
 } = require('./config');
+
+// ── Relay de mensajes de otros agentes → PMO ──────────────────────────────
+
+const PREFIJOS_RELAY = {
+  orquestador: '⚙️ [Orquestador]',
+  cfo:         '💰 [CFO]',
+};
 
 // ── Estado ────────────────────────────────────────────────────────────────
 
@@ -420,7 +474,8 @@ async function procesarInstruccionPMO(textoRaw) {
   }
 
   try {
-    const resultado = await ejecutarClaude({
+    const cambiosRecientes = obtenerCambiosRecientes(15);
+    const argsEjecutar = {
       promptFile: 'pmo-instruction.md',
       userPrompt: [
         `Proyecto: ${proyecto.nombre}`,
@@ -433,12 +488,23 @@ async function procesarInstruccionPMO(textoRaw) {
         texto,
         '',
         `IMPORTANTE: Usa SOLO las herramientas del MCP server "${proyecto.config.mcp}" para operar en este proyecto.`,
+        cambiosRecientes ? `\n## Cambios recientes del ecosistema (últimos 15)\n${cambiosRecientes}` : '',
       ].filter(Boolean).join('\n'),
       projectName: proyecto.config.mcp,
       cwd: proyecto.config.root,
       timeout: CLAUDE_TIMEOUT_INSTRUCCION_MS,
       onProgress,
-    });
+    };
+
+    let resultado = await ejecutarClaude(argsEjecutar);
+
+    // Si la sesión estaba ocupada (exitCode -5), reintentar una vez.
+    // La sesión fue invalidada en claude-runner → next call crea UUID nuevo → sin conflicto.
+    if (resultado.exitCode === -5) {
+      log(`  🔄 [${proyecto.nombre}] Sesión ocupada — reintentando con sesión nueva...`);
+      encolarRespuesta(`🔄 PMO [${proyecto.nombre}] — Sesión ocupada, reintentando...`, 'pmo');
+      resultado = await ejecutarClaude(argsEjecutar);
+    }
 
     const elapsed = Math.round((Date.now() - tsInicio) / 1000);
 
@@ -457,6 +523,14 @@ async function procesarInstruccionPMO(textoRaw) {
 
     encolarRespuesta(reporte, 'pmo');
     log(`Instrucción PMO completada: ${resultado.ok ? 'OK' : 'ERROR'} (${elapsed}s)`);
+
+    // Verificación post: detectar si Claude olvidó llamar log_change
+    if (resultado.ok) {
+      const nuevasEntradas = contarEntradasDesde(tsInicio);
+      if (nuevasEntradas === 0) {
+        log(`⚠️ PMO terminó sin registrar en changelog (puede ser consulta sin cambios)`);
+      }
+    }
 
   } catch (err) {
     const elapsed = Math.round((Date.now() - tsInicio) / 1000);
@@ -823,6 +897,48 @@ async function procesarAutocorrect(item) {
   return true; // procesado
 }
 
+// ── Relay: interceptar mensajes de agentes y re-etiquetar como 'pmo' ─────
+//
+// PMO reclama atomicamente los mensajes de orquestador/monitor/cfo antes
+// de que el dispatcher los envíe al admin. Los re-inserta con el mismo id
+// y origen='pmo', preservando los botones inline (detectarOrch/detectarMonitor
+// usan el texto y el id — ambos se conservan).
+//
+// Si el dispatcher llega primero (race condition): el mensaje se envía solo
+// al mirror del grupo (no al admin), que es el comportamiento aceptable.
+
+function relayarMensajesAgentes(db) {
+  const claimed = db.transaction(() => {
+    const items = db.prepare(`
+      SELECT * FROM mensajes_queue
+      WHERE origen IN ('orquestador', 'cfo')
+        AND enviado = 0
+      ORDER BY ts ASC
+      LIMIT 5
+    `).all();
+
+    for (const item of items) {
+      db.prepare('DELETE FROM mensajes_queue WHERE id = ?').run(item.id);
+    }
+    return items;
+  })();
+
+  for (const item of claimed) {
+    const prefijo  = PREFIJOS_RELAY[item.origen] || `[${item.origen}]`;
+    const msgRelay = `${prefijo}\n\n${item.mensaje || ''}`.slice(0, 4096);
+    const capRelay = item.caption
+      ? `${prefijo}\n${item.caption}`.slice(0, 1024)
+      : null;
+
+    db.prepare(`
+      INSERT INTO mensajes_queue (id, tipo, mensaje, file_path, caption, origen, enviado, ts)
+      VALUES (?, ?, ?, ?, ?, 'pmo', 0, ?)
+    `).run(item.id, item.tipo, msgRelay, item.file_path || null, capRelay, Date.now());
+
+    log(`  📡 Relay: [${item.origen}] ${item.id}`);
+  }
+}
+
 // ── Ciclo principal ───────────────────────────────────────────────────────
 
 async function procesarCola() {
@@ -930,7 +1046,51 @@ function iniciar() {
     );
   }
 
-  // Ciclo de polling
+  // Relay rápido: corre cada 2s (igual que el dispatcher) para minimizar
+  // la ventana en que el dispatcher puede ganar la race condition.
+  const RELAY_INTERVAL_MS = 2000;
+  setInterval(() => {
+    try {
+      relayarMensajesAgentes(obtenerDb());
+    } catch (err) {
+      log(`Error en relay: ${err.message}`);
+    }
+  }, RELAY_INTERVAL_MS);
+
+  // Cancel watcher: detecta /pmo_cancelar desde Telegram cada 2s.
+  // Mata el proceso en curso sin esperar al watchdog (respuesta en <4s).
+  setInterval(() => {
+    try {
+      const db = obtenerDb();
+      const cancelCmd = db.prepare(`
+        SELECT rowid, * FROM mensajes_responses
+        WHERE id LIKE 'pmo-cancel%' AND procesado = 0
+        ORDER BY ts ASC LIMIT 1
+      `).get();
+      if (!cancelCmd) return;
+
+      db.prepare('UPDATE mensajes_responses SET procesado = 1 WHERE rowid = ?').run(cancelCmd.rowid);
+
+      if (!estaEjecutando()) {
+        encolarRespuesta('ℹ️ PMO — no hay ejecución en curso.', 'pmo');
+        return;
+      }
+
+      log('🛑 Cancelación solicitada por admin — matando proceso en curso...');
+      limpiarProcesoHuerfano();
+      encolarRespuesta('🛑 PMO — ejecución cancelada por el admin.', 'pmo');
+
+      // Marcar ejecución activa como cancelada en DB
+      db.prepare(`
+        UPDATE pmo_ejecuciones SET estado = 'cancelado', ts_fin = ?
+        WHERE estado IN ('ejecutando', 'diagnosticando')
+      `).run(Date.now());
+    } catch (err) {
+      log(`Error en cancel watcher: ${err.message}`);
+    }
+  }, RELAY_INTERVAL_MS);
+
+  // Ciclo principal de polling (instrucciones PMO + autocorrect)
   setInterval(async () => {
     try {
       await procesarCola();
@@ -940,6 +1100,7 @@ function iniciar() {
   }, POLL_INTERVAL_MS);
 
   // Primer ciclo inmediato
+  relayarMensajesAgentes(obtenerDb());
   procesarCola().catch(err => log(`Error en primer ciclo: ${err.message}`));
 }
 

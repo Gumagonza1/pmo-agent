@@ -25,6 +25,7 @@ from mcp.types import TextContent, Tool
 PROJECT_ROOT: Path = Path(".")
 PM2_NAME: str = ""
 PROJECT_NAME: str = ""
+PM2_LOGS_DIR: Path | None = None  # Directorio de logs PM2 (leído directo del disco)
 
 # Archivos/carpetas que NUNCA se deben exponer ni modificar
 BLOCKED_PATTERNS = [
@@ -89,21 +90,39 @@ def _resolve_path(relative_path: str) -> Path:
 
 
 def _run_cmd(cmd: list[str], cwd: Path | None = None, timeout: int = 30) -> str:
-    """Ejecuta un comando y devuelve stdout+stderr."""
+    """Ejecuta un comando y devuelve stdout+stderr.
+    En Windows mata el árbol de procesos al hacer timeout (subprocess.TimeoutExpired
+    no mata los hijos por defecto en Windows).
+    """
+    proc = None
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(cwd or PROJECT_ROOT),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             shell=(sys.platform == "win32"),
         )
-        output = result.stdout
-        if result.stderr:
-            output += "\n--- stderr ---\n" + result.stderr
+        stdout, stderr = proc.communicate(timeout=timeout)
+        output = stdout
+        if stderr:
+            output += "\n--- stderr ---\n" + stderr
         return output.strip() or "(sin salida)"
     except subprocess.TimeoutExpired:
+        # Matar árbol de procesos en Windows
+        if proc:
+            try:
+                subprocess.run(
+                    ["/bin/kill", "-9", str(proc.pid)],
+                    capture_output=True, timeout=5
+                )
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return f"ERROR: Comando excedió timeout de {timeout}s"
     except Exception as e:
         return f"ERROR: {e}"
@@ -748,12 +767,60 @@ async def handle_get_status(args: dict) -> str:
 async def handle_view_logs(args: dict) -> str:
     if not PM2_NAME:
         return "ERROR: No se configuró nombre de proceso PM2"
-    lines = min(args.get("lines", 50), 200)
-    cmd = ["pm2", "logs", PM2_NAME, "--lines", str(lines), "--nostream"]
-    if args.get("err_only", False):
+    lines_count = min(args.get("lines", 50), 200)
+    err_only = args.get("err_only", False)
+
+    # ── Leer directo del archivo de log en disco (evita IPC con PM2 daemon) ──
+    import glob as _glob
+
+    def _leer_log_disco(suffix: str) -> str | None:
+        """Busca archivos de log PM2 en el directorio de logs y devuelve últimas N líneas."""
+        candidatos = []
+        # Directorio configurado vía --logs-dir
+        if PM2_LOGS_DIR and PM2_LOGS_DIR.is_dir():
+            candidatos += list(PM2_LOGS_DIR.glob(f"{PM2_NAME}-{suffix}-*.log"))
+            candidatos += list(PM2_LOGS_DIR.glob(f"{PM2_NAME}-{suffix}.log"))
+        # Fallback: directorio estándar del ecosistema
+        ecosistema_logs = Path(os.environ.get("LOGS_DIR", "/app/logs"))
+        if ecosistema_logs.is_dir():
+            candidatos += list(ecosistema_logs.glob(f"{PM2_NAME}-{suffix}-*.log"))
+        # Fallback: ~/.pm2/logs/
+        pm2_home = Path.home() / ".pm2" / "logs"
+        if pm2_home.is_dir():
+            candidatos += list(pm2_home.glob(f"{PM2_NAME}-{suffix}.log"))
+            candidatos += list(pm2_home.glob(f"{PM2_NAME}-out.log"))
+
+        if not candidatos:
+            return None
+
+        # El más reciente
+        log_file = max(candidatos, key=lambda p: p.stat().st_mtime)
+        try:
+            content = log_file.read_text(encoding="utf-8", errors="replace")
+            tail = content.splitlines()[-lines_count:]
+            return f"# {log_file.name}\n\n" + "\n".join(tail)
+        except Exception as e:
+            return f"ERROR leyendo {log_file}: {e}"
+
+    if not err_only:
+        out_content = _leer_log_disco("out")
+        if out_content:
+            err_content = _leer_log_disco("error") or ""
+            combined = out_content
+            if err_content and "error" in err_content.lower():
+                combined += f"\n\n{err_content}"
+            return f"# Logs de {PM2_NAME} (últimas {lines_count} líneas)\n\n{combined}"
+    else:
+        err_content = _leer_log_disco("error")
+        if err_content:
+            return f"# Logs [stderr] de {PM2_NAME}\n\n{err_content}"
+
+    # ── Fallback: pm2 logs con timeout corto ─────────────────────────────────
+    cmd = ["pm2", "logs", PM2_NAME, "--lines", str(lines_count), "--nostream"]
+    if err_only:
         cmd.append("--err")
-    output = _run_cmd(cmd, timeout=15)
-    return f"# Logs de {PM2_NAME} (últimas {lines} líneas)\n\n{output}"
+    output = _run_cmd(cmd, timeout=12)
+    return f"# Logs de {PM2_NAME} (últimas {lines_count} líneas)\n\n{output}"
 
 
 async def handle_restart_process(args: dict) -> str:
@@ -1063,6 +1130,7 @@ if __name__ == "__main__":
     parser.add_argument("--root", required=True, help="Ruta raíz del proyecto")
     parser.add_argument("--pm2", default="", help="Nombre del proceso PM2")
     parser.add_argument("--name", default="", help="Nombre descriptivo del proyecto")
+    parser.add_argument("--logs-dir", default="", help="Directorio de logs PM2 (para leer sin IPC)")
     parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
     parser.add_argument("--port", type=int, default=8081)
     args = parser.parse_args()
@@ -1070,6 +1138,7 @@ if __name__ == "__main__":
     PROJECT_ROOT = Path(args.root).resolve()
     PM2_NAME = args.pm2
     PROJECT_NAME = args.name or PM2_NAME or PROJECT_ROOT.name
+    PM2_LOGS_DIR = Path(args.logs_dir).resolve() if args.logs_dir else None
 
     if not PROJECT_ROOT.is_dir():
         print(f"ERROR: Directorio no encontrado: {args.root}", file=sys.stderr)

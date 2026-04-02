@@ -1,10 +1,8 @@
-# PMO Agent
+# 🤖 PMO Agent — Ecosistema Aragón
 
-Agente autónomo que ejecuta instrucciones de gestión de código y autocorrecciones de errores en proyectos PM2, usando **Claude Code CLI (plan Max)** como cerebro — sin API key, sin costos por token.
+Agente autónomo de gestión de código para el ecosistema Tacos Aragón. Monitorea una cola SQLite y ejecuta instrucciones sobre cualquier proyecto usando **Claude Code CLI** (`claude -p`) con el plan Max — sin API key propia. Puede actuar por instrucción del admin desde Telegram o de forma autónoma al detectar errores repetidos (modo autocorrección).
 
-Diseñado para equipos que operan microservicios en producción y necesitan un PMO que pueda leer, editar, commitear y reiniciar servicios desde Telegram.
-
-## Cómo funciona
+## Arquitectura y flujo
 
 ```
 Admin (Telegram)
@@ -14,15 +12,16 @@ telegram-dispatcher
     │  Escribe en SQLite (mensajes_responses)
     ▼
 ★ pmo-agent (este proyecto)
-    │  Poll cada 10s → identifica proyecto → spawns:
-    │  claude -p --mcp-config proyecto.json --model sonnet
+    │  Poll cada 10s → identifica proyecto → inyecta últimos 15 cambios
+    │  → spawns claude -p con MCP config del proyecto
     ▼
 mcp-project-server (Python)
-    │  24 herramientas: read_file, edit_file, git_commit,
-    │  restart_process, view_logs, run_tests, search_code...
+    │  26 herramientas: read_file, edit_file, git_commit,
+    │  restart_process, view_logs, run_tests, log_change, search_changes...
     ▼
 Proyecto target
     │  Lee/edita código, reinicia PM2, verifica health
+    │  → log_change() escribe en C:/SesionBot/changelogs/<agente>.jsonl
     ▼
 Resultado → SQLite → telegram-dispatcher → Admin
 ```
@@ -34,15 +33,28 @@ El PMO Agent **no llama a la API de Anthropic**. Invoca `claude -p` (modo no-int
 ```
 claude -p
   --model sonnet
-  --mcp-config proyecto.json
+  --mcp-config proyecto.json        # solo el MCP del proyecto target
   --permission-mode bypassPermissions
-  --session-id UUID
-  --max-budget-usd 2.00
+  --session-id <uuid>               # sesión de 1h por proyecto
+  --max-turns 20
 ```
+
+## Relay de otros agentes
+
+El PMO actúa como relay para orquestador y CFO. Cuando detecta mensajes de esos orígenes en la cola, los re-etiqueta con prefijo `⚙️ [Orquestador]` o `💰 [CFO]` y los encola como `origen='pmo'`, de modo que lleguen al chat privado del admin (que solo acepta `ORIGENES_PRIVADO = ['pmo', 'monitor']`).
+
+```javascript
+const PREFIJOS_RELAY = {
+  orquestador: '⚙️ [Orquestador]',
+  cfo:         '💰 [CFO]',
+};
+```
+
+---
 
 ## Dos modos de operación
 
-### 1. Instrucción del admin (`!pmo`)
+### 1. Instrucción manual (`!pmo`)
 
 El admin envía un mensaje en Telegram:
 
@@ -89,7 +101,7 @@ Los mensajes comparten un contexto de sesión que dura 1 hora. Claude recuerda t
 
 Comandos de sesión: `!pmo sesion`, `!pmo nueva sesion`
 
-## MCP Project Server — 24 herramientas
+## MCP Project Server — 26 herramientas
 
 Cada proyecto tiene su propia instancia del servidor MCP (Python), scoped a su directorio raíz:
 
@@ -101,6 +113,7 @@ Cada proyecto tiene su propia instancia del servidor MCP (Python), scoped a su d
 | **PM2** (5) | `get_status`, `view_logs`, `restart_process`, `stop_process`, `start_process` |
 | **Testing** (2) | `run_tests`, `check_health` |
 | **Contexto** (3) | `read_claude_md`, `get_dependencies`, `run_command` |
+| **Changelog** (2) | `log_change`, `search_changes` |
 
 ### Seguridad del MCP Server
 
@@ -110,9 +123,23 @@ Cada proyecto tiene su propia instancia del servidor MCP (Python), scoped a su d
 - Comandos destructivos filtrados: `rm -rf /`, `format`, `shutdown`, `curl|bash`, `eval $()`, fork bombs, `chmod 777` y más (13 substrings + 5 regex)
 - Máximo 500KB por archivo
 
+## Cancelación desde Telegram: `/pmo_cancelar`
+
+El admin puede cancelar una ejecución en curso directamente desde Telegram:
+
+```
+Admin: /pmo_cancelar
+→ telegram-dispatcher escribe cancellation en mensajes_responses
+→ pmo-agent detecta la señal
+→ Ejecuta taskkill /F /T /PID <pid_claude> (Windows)
+→ Libera todos los pipes abiertos (fix del pipe deadlock)
+→ Encola: "⛔ Ejecución PMO cancelada"
+→ Limpia el estado de la sesión activa
+```
+
 ## Atajos de Telegram
 
-15 comandos registrados con autocompletado (escribir `/` para ver el menú):
+Comandos registrados con autocompletado (escribir `/` para ver el menú):
 
 | Comando | Función |
 |---|---|
@@ -120,6 +147,7 @@ Cada proyecto tiene su propia instancia del servidor MCP (Python), scoped a su d
 | `/pmo_sesion` | Ver sesión activa (tiempo, mensajes, proyectos) |
 | `/pmo_estado` | Últimas 5 ejecuciones |
 | `/pmo_reset` | Borrar sesión, empezar contexto nuevo |
+| `/pmo_cancelar` | **Cancelar ejecución en curso** |
 | `/pmo_bot` | Instrucción a TacosAragon |
 | `/pmo_api` | Instrucción a tacos-api |
 | `/pmo_cfo` | Instrucción a cfo-agent |
@@ -128,6 +156,88 @@ Cada proyecto tiene su propia instancia del servidor MCP (Python), scoped a su d
 | `/pmo_portfolio` | Instrucción a portfolio |
 
 Los atajos por proyecto aceptan instrucción directa: `/pmo_api agrega endpoint /health`
+
+## Sistema de changelog
+
+Al terminar cualquier tarea que modifique archivos, Claude llama a `log_change` (herramienta MCP), que escribe en `C:/SesionBot/changelogs/<agente>.jsonl`:
+
+```jsonl
+{
+  "ts": "2026-03-25T14:30:00-07:00",
+  "agente": "pmo-agent",
+  "origen": "user",
+  "titulo": "Agregar validación RFC en pedidos",
+  "desc": "Agregada regex RFC en src/pedidos.js línea 87. Corrige crash cuando cliente omite guión.",
+  "archivos": ["src/pedidos.js"],
+  "tags": ["bug", "tacos-bot"]
+}
+```
+
+### Inyección automática de cambios recientes
+
+Antes de cada ejecución, `obtenerCambiosRecientes(15)` lee todos los archivos `.jsonl` de `C:/SesionBot/changelogs/`, los ordena por timestamp y toma los 15 más recientes. Este bloque se inyecta al inicio del system prompt:
+
+```
+--- ÚLTIMOS 15 CAMBIOS EN EL ECOSISTEMA ---
+[2026-03-25T14:30:00] pmo-agent (user): Fix RFC | Agregada regex ... | tags: bug,tacos-bot
+[2026-03-25T13:00:00] pmo-agent (autofix): Restart loop | ... | tags: timeout,session
+...
+```
+
+Esto permite a Claude entender el contexto reciente antes de atender una nueva instrucción, sin necesidad de examinar el historial git de cada proyecto.
+
+---
+
+## Protocolo XML
+
+El dispatcher y el PMO se comunican con mensajes estructurados en XML para instrucciones complejas o de múltiples pasos:
+
+```xml
+<pmo_instruccion>
+  <proyecto>tacos-api</proyecto>
+  <prioridad>alta</prioridad>
+  <instruccion>Agregar endpoint GET /health con timestamp y versión</instruccion>
+  <contexto>La app móvil necesita verificar si la API está activa</contexto>
+</pmo_instruccion>
+```
+
+El PMO extrae los campos, construye el prompt enriquecido y los pasa a Claude. Las propuestas de cambio multi-paso también se encapsulan en XML en la respuesta.
+
+---
+
+## Fix del pipe deadlock en Windows
+
+**Problema:** En Windows, cuando `claude -p` lanzaba subprocesos nietos (p.ej. `curl` dentro de `run_command`), esos procesos mantenían el pipe de stdout abierto después de que el padre terminaba, bloqueando al agente indefinidamente.
+
+**Solución en `claude-runner.js`:**
+
+```javascript
+// spawn() en lugar de exec() — permite matar árbol completo
+const proc = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+// Al cancelar o en timeout:
+if (process.platform === 'win32') {
+  execSync(`taskkill /F /T /PID ${proc.pid}`, { stdio: 'ignore' });
+  // /T = kill árbol completo de procesos hijos
+}
+proc.kill();
+```
+
+La misma lógica está en `mcp-project-server/server.py` para `subprocess.Popen` + `taskkill /F /T` en `_run_cmd()`.
+
+---
+
+## Verificación post-ejecución
+
+Después de cualquier fix que involucre reinicio, el PMO realiza tres verificaciones:
+
+1. **Estado PM2:** `pm2 list | grep <nombre>` → debe estar `online`
+2. **Health HTTP:** `GET http://localhost:<puerto>/health` → debe devolver 200 (si aplica)
+3. **Conteo de errores nuevos:** compara líneas de error antes y después en el log
+
+Si alguna falla, el PMO reporta al admin con el log relevante y no marca la tarea como exitosa.
+
+---
 
 ## Seguridad anti-alucinación — Auto-healing
 
@@ -169,41 +279,42 @@ Admin puede revertir
     └  git stash pop (determinista, sin IA)
 ```
 
-## Optimizaciones
+## Optimizaciones de rendimiento
 
 | Optimización | Detalle |
 |---|---|
-| MCP config dinámico | Solo carga el server del proyecto target (no todos) |
-| Cache de system prompts | Lee .md una vez, invalida por mtime del archivo |
-| Guard anti-reentrancia | Previene ejecuciones duplicadas |
-| Cleanup de huérfanos | Mata procesos Claude que quedaron vivos |
+| MCP config dinámico | Solo carga el MCP server del proyecto target, no los 6 |
+| Cache de system prompts | Lee `.md` una vez, invalida por `mtime` del archivo |
+| Guard anti-reentrancia | Previene ejecuciones duplicadas del mismo proyecto |
+| Cleanup de huérfanos | `taskkill /F /T` para matar procesos Claude que quedaron vivos |
 | `--max-turns 20` | Limita tool calls por ejecución, evita loops de herramientas |
 | Sesiones 1h / 8 mensajes | Claude retiene contexto entre instrucciones del mismo proyecto |
 | Recovery al reiniciar | Marca como interrumpidas las ejecuciones que quedaron colgadas |
+| Changelog en system prompt | Últimos 15 cambios inyectados → Claude tiene contexto histórico |
 
 ## Estructura
 
 ```
 pmo-agent/
-├── index.js                    # Proceso principal: polling + dispatch
-├── claude-runner.js             # Wrapper para claude -p (spawn, sesiones, progreso)
-├── config.js                    # Mapa de proyectos, rutas, tiempos, constantes de seguridad
-├── mcp-projects.json            # Config MCP completo (6 proyectos)
-├── package.json                 # Dependencia: better-sqlite3
-├── ecosystem.config.js          # Config PM2
+├── index.js                       # Proceso principal: polling, dispatch, relay
+├── claude-runner.js               # Wrapper claude -p: spawn, sesiones, timeout, XML
+├── config.js                      # Mapa de proyectos, topics, timeouts, constantes seguridad
+├── mcp-projects.json              # Config MCP completo (6 proyectos)
+├── package.json                   # Dependencia: better-sqlite3
+├── ecosystem.config.js            # Config PM2
 ├── prompts/
-│   ├── autocorrect-diagnostico.md  # System prompt fase 1: solo diagnosticar
-│   ├── autocorrect.md              # System prompt fase 2: aplicar fix
-│   ├── pmo-instruction.md          # System prompt: instrucciones del admin
-│   ├── topic-bot.md                # System prompt para thread TacosAragon
-│   ├── topic-api.md                # System prompt para thread tacos-api
-│   ├── topic-cfo.md                # System prompt para thread cfo-agent
-│   ├── topic-monitor.md            # System prompt para thread MonitorBot
-│   └── topic-general.md            # System prompt para thread General
-└── state/                          # Estado interno (cooldowns)
+│   ├── autocorrect-diagnostico.md # System prompt fase 1: solo diagnosticar (sin editar)
+│   ├── autocorrect.md             # System prompt fase 2: aplicar fix + verificar
+│   ├── pmo-instruction.md         # System prompt: instrucciones del admin
+│   ├── topic-bot.md               # Thread TacosAragon
+│   ├── topic-api.md               # Thread tacos-api
+│   ├── topic-cfo.md               # Thread cfo-agent
+│   ├── topic-monitor.md           # Thread MonitorBot
+│   └── topic-general.md           # Fallback general
+└── state/                         # Estado interno (cooldowns activos)
 
 ../mcp-project-server/
-└── server.py                    # 24 herramientas MCP (blocklist expandida)
+└── server.py                      # 26 herramientas MCP (incluye log_change, search_changes)
 ```
 
 ## Configuración
@@ -310,17 +421,17 @@ Plan Max se justifica cuando el PMO se usa 70+ veces/día, o cuando se suma el u
 
 ## Comunicación SQLite
 
-## Licencia
-
-Aragón Attribution License v1.0 — Uso libre con atribución obligatoria. Ver [LICENSE](LICENSE).
-
-## Comunicación SQLite
-
-Usa la misma base de datos que el resto del ecosistema:
+Usa la misma base de datos compartida del ecosistema:
 
 | Tabla | Lee | Escribe | Qué |
 |---|---|---|---|
-| `mensajes_responses` | `id LIKE 'pmo%'` | — | Instrucciones del admin |
-| `mensajes_queue` | `origen = 'autocorrect'` | `origen = 'pmo'` | Autocorrections + reportes |
-| `pmo_ejecuciones` | — | sí | Historial de ejecuciones |
+| `mensajes_responses` | `id LIKE 'pmo%'` | — | Instrucciones del admin e IDs de cancelación |
+| `mensajes_queue` | `origen = 'autocorrect'` | `origen = 'pmo'` | Autocorrecciones + reportes + relay |
+| `pmo_ejecuciones` | — | sí | Historial de ejecuciones (estado, timestamps) |
+
+---
+
+## Licencia
+
+Aragón Attribution License v1.0 — Uso libre con atribución obligatoria. Ver [LICENSE](LICENSE).
 

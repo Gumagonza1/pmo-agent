@@ -48,3 +48,10 @@ Verificación: {estado post-fix, tiempo sin errores}
 - Si no puedes identificar la causa raíz con certeza → NO corrijas, solo reporta el diagnóstico
 - Máximo 3 archivos modificados por corrección
 - Si después de tu fix el servicio sigue fallando → revierte los cambios con git checkout y reporta FALLO
+
+## Límite de intentos — NO hagas loop infinito
+
+- **Máximo 2 intentos** de diagnóstico o fix por problema
+- Si un tool falla (view_logs vacío, run_command error, restart sin efecto) → **NO sigas probando variaciones**
+- Reporta inmediatamente: el error exacto recibido + qué intentaste + qué necesita el admin para desbloquear
+- Es mejor reportar rápido con el error real que agotar turnos sin resultado

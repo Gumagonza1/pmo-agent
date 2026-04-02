@@ -197,20 +197,16 @@ function procesarEventoJSON(event, finalOutputRef, progress) {
 // ── Guard anti-reentrancia ────────────────────────────────────────────────
 
 let _ejecutando = false;
-let _pidActual = null;
+let _pidActual   = null;
 
 function estaEjecutando() { return _ejecutando; }
 
-// ── Matar árbol de procesos en Windows ────────────────────────────────────
+// ── Matar árbol de procesos (Linux) ─────────────────────────────────────
 
 function matarArbol(pid) {
   if (!pid) return;
-  try {
-    require('child_process').execSync(
-      `taskkill /F /T /PID ${pid}`,
-      { stdio: 'ignore' }
-    );
-  } catch {}
+  try { process.kill(pid, 'SIGKILL'); } catch {}
+  try { process.kill(-pid, 'SIGKILL'); } catch {}
 }
 
 function limpiarProcesoHuerfano() {
@@ -271,43 +267,29 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
     }
 
     // ── Args ────────────────────────────────────────────────────────────
-    const comspec = process.env.COMSPEC || 'C:\\Windows\\system32\\cmd.exe';
-
     progress('🧠 Pensando...');
 
-    // ── Escribir prompt + .bat temporal ────────────────────────────────
+    // ── Escribir prompt temporal ────────────────────────────────────────
     const tmpId = crypto.randomBytes(6).toString('hex');
     const tmpPrompt = path.join(os.tmpdir(), `pmo-prompt-${tmpId}.txt`);
-    const tmpBat = path.join(os.tmpdir(), `pmo-run-${tmpId}.bat`);
 
     fs.writeFileSync(tmpPrompt, fullPrompt, 'utf-8');
 
-    // --session-id hace create-or-resume automáticamente, evita hang de --resume con sesión no encontrada
     const sessionFlag = `--session-id ${sessionId}`;
 
-    const batContent = [
-      '@echo off',
-      `type "${tmpPrompt}" | claude -p ^`,
-      `  --output-format stream-json ^`,
-      `  --verbose ^`,
-      `  --model sonnet ^`,
-      `  ${sessionFlag} ^`,
-      `  --mcp-config "${mcpConfigPath}" ^`,
-      `  --strict-mcp-config ^`,
-      `  --permission-mode bypassPermissions ^`,
-      `  --max-turns 20 ^`,
-      `  --max-budget-usd 2.00`,
-    ].join('\r\n');
-
-    fs.writeFileSync(tmpBat, batContent, 'utf-8');
-
-    // procesarEventoJSON definido a nivel de módulo
+    const shellCmd = `cat "${tmpPrompt}" | claude -p` +
+      ` --output-format stream-json` +
+      ` --verbose` +
+      ` --model sonnet` +
+      ` ${sessionFlag}` +
+      ` --mcp-config "${mcpConfigPath}"` +
+      ` --strict-mcp-config` +
+      ` --permission-mode bypassPermissions` +
+      ` --max-turns 20` +
+      ` --max-budget-usd 2.00`;
 
     // ── Spawn ───────────────────────────────────────────────────────────
-    // Watchdog por inactividad: solo dispara si no hay output durante INACTIVITY_MS.
-    // Si Claude está trabajando (datos fluyendo), el timer se resetea.
-    // Hard cap = timeoutMs para evitar ejecuciones infinitas.
-    const INACTIVITY_MS = 3 * 60 * 1000; // 3 min sin ningún byte → atascado
+    const INACTIVITY_MS = 3 * 60 * 1000;
 
     return await new Promise((resolve) => {
       let rawOutput        = '';
@@ -315,11 +297,10 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
       let stderrBuf        = '';
       let finished         = false;
       let lastActivityAt   = Date.now();
-      const finalOutputRef = { value: '' }; // llenado por el evento 'result'
+      const finalOutputRef = { value: '' };
 
-      const proc = spawn(comspec, ['/c', tmpBat], {
+      const proc = spawn('/bin/sh', ['-c', shellCmd], {
         cwd,
-        windowsHide: true,
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -327,7 +308,7 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
       _pidActual = proc.pid;
 
       proc.stdout.on('data', (data) => {
-        lastActivityAt = Date.now(); // resetear watchdog con cada byte recibido
+        lastActivityAt = Date.now();
         const chunk = data.toString();
         rawOutput  += chunk;
         lineBuffer += chunk;
@@ -350,6 +331,28 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
         if (chunk) {
           stderrBuf += chunk + '\n';
           log(`  ⚠️ [stderr] ${chunk.slice(0, 300)}`);
+
+          // Detectar "session already in use" → matar proceso inmediatamente
+          // y resolver con código especial para que el caller reintente sin sesión.
+          // (Si solo invalidamos la sesión, lastActivityAt se resetea con cada byte
+          //  de stderr y el watchdog nunca dispara → PMO bloqueado hasta hard cap)
+          if (chunk.toLowerCase().includes('session') &&
+              (chunk.toLowerCase().includes('already in use') ||
+               chunk.toLowerCase().includes('in use') ||
+               chunk.toLowerCase().includes('already exists'))) {
+            log(`  🔄 Sesión ocupada — matando proceso y resolviendo para reintento`);
+            const key = projectName || 'global';
+            sesionesActivas.delete(key);
+            if (!finished) {
+              clearInterval(watchdog);
+              clearTimeout(hardCap);
+              finished = true;
+              matarArbol(proc.pid);
+              cleanup();
+              _pidActual = null;
+              resolve({ ok: false, output: 'SESSION_IN_USE', exitCode: -5, sessionId });
+            }
+          }
         }
       });
 
@@ -364,6 +367,7 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
           matarArbol(proc.pid);
           cleanup();
           _pidActual = null;
+          sesionesActivas.delete(projectName || 'global'); // sesión no recuperable tras kill
           log(`  ⏱️ Inactividad ${Math.round(inactivoMs / 1000)}s — proceso cortado`);
           resolve({
             ok: false,
@@ -383,6 +387,7 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
           matarArbol(proc.pid);
           cleanup();
           _pidActual = null;
+          sesionesActivas.delete(projectName || 'global'); // sesión no recuperable tras kill
           log(`  ⏱️ Hard cap alcanzado (${timeoutMs / 60000}min)`);
           resolve({
             ok: false,
@@ -396,7 +401,7 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
 
       function cleanup() {
         try { fs.unlinkSync(tmpPrompt); } catch {}
-        try { fs.unlinkSync(tmpBat); } catch {}
+        // tmpBat removed (Linux uses shell cmd directly)
       }
 
       proc.on('close', (code) => {
@@ -439,4 +444,4 @@ async function ejecutarClaude({ promptFile, userPrompt, projectName, cwd, timeou
   }
 }
 
-module.exports = { ejecutarClaude, getSesionInfo, getAllSesionesInfo, resetSesion, resetSesionProyecto, estaEjecutando };
+module.exports = { ejecutarClaude, getSesionInfo, getAllSesionesInfo, resetSesion, resetSesionProyecto, estaEjecutando, limpiarProcesoHuerfano };
