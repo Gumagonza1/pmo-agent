@@ -78,13 +78,13 @@ Verificación: {servicio online, sin errores, tests pasando}
 
 ## APIs locales (para consultas de datos, usar run_command con curl)
 
-- tacos-api (:3001): `curl -s -H "x-api-token: SCRUBBED_TACOS_API_TOKEN" http://tacos-api:3001/api/...`
+- tacos-api (:3001): `curl -s -H "x-api-token: ${TACOS_API_TOKEN}" http://tacos-api:3001/api/...`
   - /api/dashboard — resumen hoy+semana+mes
   - /api/ventas/resumen?periodo=hoy|ayer|semana|mes o ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD
   - /api/ventas/por-producto, /api/ventas/tipos-pago, /api/ventas/empleados-ventas
   - /api/whatsapp/stats, /api/facturacion/lista
 
-- cfo-agent (:3002): `curl -s -H "x-api-token: SCRUBBED_CFO_AGENT_TOKEN" http://cfo-agent:3002/api/...`
+- cfo-agent (:3002): `curl -s -H "x-api-token: ${CFO_AGENT_TOKEN}" http://cfo-agent:3002/api/...`
   - /api/contabilidad/ingresos, /api/contabilidad/gastos
   - /api/inventario, /api/inventario/analisis
   - /api/impuestos/resultado, /api/impuestos/historial
